@@ -1,0 +1,39 @@
+-----------------------------------
+-- BOT SETTINGS (modules/bots)
+-----------------------------------
+-- The pool itself is the bot_pool table. A row with charid 0 gets its account and character on the next start.
+
+xi          = xi or {}
+xi.settings = xi.settings or {}
+
+xi.settings.bots =
+{
+    ENABLED        = true,
+    MAX_ONLINE     = 36,  -- Bots online at once while real players are connected; those in a zone with no real player stand idle
+    LOGIN_INTERVAL = 8,   -- Seconds between bot logins
+    LOGOUT_GRACE   = 180, -- Seconds after the last real player leaves before the bots go
+    ROTATE_MINUTES = 20,  -- Every this many minutes one bot outside a party swaps for another. 0 turns it off
+
+    BOTS_PER_PLAYER_ZONE = 3,  -- Bots outside a party kept in every zone a real player is in. 0 turns it off
+    CAMP_CHANCE          = 70, -- Percent of logins that start at a camp for the bot's level instead of the pool home
+    HUNT                 = true, -- Bots without a party hunt monsters near their level, in zones with real players
+    BOT_PARTIES          = true, -- Unpartied bots in a zone with real players sometimes team up and hunt together
+
+    -- Chat through any OpenAI-style chat completions endpoint. Personalities are in bot_pool.personality.
+    -- Default is the local llama-server (systemctl --user start lsb-chat). For a hosted API, e.g. OpenAI:
+    --   LLM_URL = 'https://api.openai.com/v1/chat/completions', LLM_API_KEY = 'sk-...', LLM_MODEL = 'gpt-4o-mini'
+    -- An API key here is a secret: keep this file private (chmod 600).
+    CHAT_ENABLED = true,
+    LLM_URL      = 'http://127.0.0.1:8085/v1/chat/completions',
+    LLM_API_KEY  = '', -- sent as "Authorization: Bearer <key>" when set
+    LLM_MODEL    = '', -- required by hosted APIs; llama-server ignores it
+    LLM_TIMEOUT  = 30, -- seconds
+    LLM_ORDERS   = true, -- the model reads party chat for requests and picks which bot does what; false uses keyword matching
+
+    CHAT_PARTY_MINUTES = 4,  -- About this often a bot in your party starts some small talk (and sometimes after a fight). 0 turns it off
+    CHAT_SHOUT_MINUTES = 10, -- About this often a bot without a party shouts for one, when real players are in its zone. 0 turns it off
+
+    -- Half the pool wears this linkshell's pearl; send any of them a tell asking for a pearl to join. Letters only; '' turns it off
+    LINKSHELL              = 'Wanderers',
+    CHAT_LINKSHELL_MINUTES = 6, -- About this often someone in it says something, while a real player wears the pearl. 0 turns it off
+}
