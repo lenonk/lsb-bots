@@ -8,6 +8,7 @@
 
 #include "bots.h"
 
+#include "common/logging.h"
 #include "common/utils.h"
 
 #include "map/ability.h"
@@ -51,10 +52,14 @@ namespace
 using xi::Job;
 using xi::StatusEffect;
 
-constexpr float kSpellRange   = 20.0f;
-constexpr uint8 kEmergencyHPP = 40;
-constexpr int64 kHateMargin   = 80; // percent of the holder's enmity a damage dealer stays under
-constexpr uint8 kWhmCureHPP   = 75;
+constexpr float kSpellRange      = 20.0f;
+constexpr uint8 kEmergencyHPP    = 40;
+constexpr int64 kHateMargin      = 80; // percent of the holder's enmity a damage dealer stays under
+constexpr uint8 kWhmCureHPP      = 75;
+constexpr uint8 kHasteTankMPP    = 50; // a healer hastes the tank down to this
+constexpr uint8 kHasteAllMPP     = 85; // and every melee above this
+constexpr uint8 kStrangerCureMPP = 50; // a passer-by is cured only with this much MP left
+constexpr uint8 kStrangerBuffMPP = 90; // and given Protect or Shell only with this
 
 // Everyone in the party in this zone, the dead included.
 auto partyMembersAll(CCharEntity* PChar) -> std::vector<CBattleEntity*>
@@ -316,16 +321,112 @@ auto enmityOn(CBattleEntity* PTarget, CBattleEntity* PEntity) -> int64
     return static_cast<int64>(PMob->PEnmityContainer->GetCE(PEntity)) + PMob->PEnmityContainer->GetVE(PEntity);
 }
 
-// Damage that would bring a damage dealer's enmity this close to the main tank's waits until the tank pulls ahead.
+auto volatileOn(CBattleEntity* PTarget, CBattleEntity* PEntity) -> int64
+{
+    auto* PMob = dynamic_cast<CMobEntity*>(PTarget);
+    return PMob != nullptr && PMob->PEnmityContainer != nullptr ? PMob->PEnmityContainer->GetVE(PEntity) : 0;
+}
+
+// Damage that would bring a damage dealer's enmity this close to whoever holds the monster waits until they pull ahead.
+// Only the main tank never holds back, and a party without one still keeps off whoever has it.
 auto nearHate(CCharEntity* PChar, CBattleEntity* PTarget) -> bool
 {
     auto* PHolder = PTarget->GetBattleTarget();
-    auto* PTank   = mainTank(PChar);
-    if (PHolder == nullptr || PHolder == PChar || PTank == nullptr || PTank == PChar)
+    if (PHolder == nullptr || PHolder == PChar || mainTank(PChar) == PChar)
     {
         return false;
     }
     return enmityOn(PTarget, PChar) * 100 >= enmityOn(PTarget, PHolder) * kHateMargin;
+}
+
+constexpr std::size_t kNukeRatios = 5;    // recent nukes the estimate learns from
+constexpr float       kBurstHate  = 1.5f; // a magic burst's damage over a plain nuke's
+
+// What a nuke would add to this bot's enmity: LSB counts damage as 80 CE and 240 VE over the monster's level divisor,
+// and the damage is the spell's base plus its multiplier on the INT gap.
+auto nukeEstimate(CCharEntity* PChar, CBattleEntity* PTarget, const CSpell* PSpell) -> int64
+{
+    const auto gap    = std::max(0, static_cast<int>(PChar->INT()) - static_cast<int>(PTarget->INT()));
+    const auto damage = static_cast<float>(PSpell->getBase()) + PSpell->getMultiplier() * static_cast<float>(gap);
+    return static_cast<int64>(320.0f * damage / static_cast<float>(battleutils::GetEnmityModDamage(PTarget->GetMLevel())));
+}
+
+// The estimate scaled to what this bot's nukes have really added (gear, merits, resists): the largest of the last few.
+auto nukeScale(const Bot& bot) -> float
+{
+    return bot.nukeRatios.empty() ? 1.25f : *std::ranges::max_element(bot.nukeRatios);
+}
+
+// A nuke that keeps this bot under the margin of whoever holds the monster, counting the enmity it would add.
+auto nukeFits(const Bot& bot, CCharEntity* PChar, CBattleEntity* PTarget, const CSpell* PSpell, const float burst) -> bool
+{
+    auto* PHolder = PTarget->GetBattleTarget();
+    if (PHolder == nullptr || PHolder == PChar || mainTank(PChar) == PChar)
+    {
+        return true;
+    }
+    const auto added = static_cast<int64>(static_cast<float>(nukeEstimate(PChar, PTarget, PSpell)) * nukeScale(bot) * burst);
+    return (enmityOn(PTarget, PChar) + added) * 100 < enmityOn(PTarget, PHolder) * kHateMargin;
+}
+
+auto castNuke(Bot& bot, PacketSystem& packets, const SpellID id, CBattleEntity* PTarget, const float burst, const timer::time_point tick) -> bool
+{
+    auto*       PChar  = bot.entity();
+    const auto* PSpell = spell::GetSpell(id);
+    if (PSpell == nullptr || !nukeFits(bot, PChar, PTarget, PSpell, burst))
+    {
+        return false;
+    }
+
+    const auto before   = enmityOn(PTarget, PChar);
+    const auto beforeVE = volatileOn(PTarget, PChar);
+    if (!tryCast(bot, packets, id, PTarget, 0s, tick))
+    {
+        return false;
+    }
+    bot.nukeWatch = NukeWatch{ EntityId(PTarget), id, before, beforeVE, static_cast<int64>(static_cast<float>(nukeEstimate(PChar, PTarget, PSpell)) * burst), tick };
+    return true;
+}
+
+// The last nuke has landed: what it added against the estimate goes into the scale. One that took the monster off
+// the main tank is logged, so the margin can be checked against real fights.
+void learnNuke(Bot& bot, CCharEntity* PChar, const timer::time_point tick)
+{
+    if (!bot.nukeWatch)
+    {
+        return;
+    }
+    const auto watch = *bot.nukeWatch;
+    bot.nukeWatch.reset();
+
+    auto* PTarget = watch.target.resolve<CBattleEntity>();
+    if (PTarget == nullptr || PTarget->isDead() || watch.estimate <= 0)
+    {
+        return;
+    }
+
+    // The volatile part lost while it was cast goes back on: 60 a second.
+    const auto seconds = std::chrono::duration<float>(tick - watch.castAt).count();
+    const auto decayed = std::min(watch.beforeVE, static_cast<int64>(60.0f * seconds));
+    const auto added   = enmityOn(PTarget, PChar) - watch.before + decayed;
+    if (added <= 0)
+    {
+        return; // interrupted, or it missed
+    }
+
+    bot.nukeRatios.push_back(static_cast<float>(added) / static_cast<float>(watch.estimate));
+    if (bot.nukeRatios.size() > kNukeRatios)
+    {
+        bot.nukeRatios.pop_front();
+    }
+
+    auto* PTank = mainTank(PChar);
+    if (PTarget->GetBattleTarget() == PChar && PTank != nullptr && PTank != PChar)
+    {
+        const auto* PSpell = spell::GetSpell(watch.spell);
+        ShowInfoFmt("bots: {} took {} off {} with {}: added {} enmity, estimated {} (scale now {:.2f})", PChar->getName(), PTarget->getName(), PTank->getName(),
+                    PSpell != nullptr ? const_cast<CSpell*>(PSpell)->getName() : std::string("a nuke"), added, watch.estimate, nukeScale(bot));
+    }
 }
 
 auto holdDamage(CCharEntity* PChar, CBattleEntity* PTarget) -> bool
@@ -577,9 +678,11 @@ constexpr SpellID kNukes[] = { SpellID::Thunder_III, SpellID::Blizzard_III, Spel
                                SpellID::Thunder_II,  SpellID::Blizzard_II,  SpellID::Fire_II,  SpellID::Aero_II,  SpellID::Water_II,  SpellID::Stone_II,
                                SpellID::Thunder,     SpellID::Blizzard,     SpellID::Fire,     SpellID::Aero,     SpellID::Water,     SpellID::Stone };
 
+// Each nuke is the strongest whose enmity keeps the bot under whoever holds the monster, a burst included; when even
+// the weakest would pull it, the bot waits for the holder to get further ahead.
 auto nuke(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::duration cooldown, const timer::time_point tick) -> bool
 {
-    if (holdDamage(bot.entity(), PTarget))
+    if (pulledHate(bot.entity(), PTarget))
     {
         return false;
     }
@@ -592,7 +695,7 @@ auto nuke(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::
         {
             const auto* PSpell = spell::GetSpell(id);
             if (PSpell != nullptr && std::ranges::find(elements, static_cast<ELEMENT>(PSpell->getElement())) != elements.end() &&
-                tryCast(bot, packets, id, PTarget, 0s, tick))
+                castNuke(bot, packets, id, PTarget, kBurstHate, tick))
             {
                 callout(bot, fmt::format("Magic Burst: {}!", pretty(const_cast<CSpell*>(PSpell)->getName())), true);
                 return true;
@@ -606,7 +709,7 @@ auto nuke(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::
         return false;
     }
 
-    return std::ranges::any_of(kNukes, [&](const SpellID id) { return tryCast(bot, packets, id, PTarget, 0s, tick); });
+    return std::ranges::any_of(kNukes, [&](const SpellID id) { return castNuke(bot, packets, id, PTarget, 1.0f, tick); });
 }
 
 auto sing(Bot& bot, PacketSystem& packets, const std::vector<CBattleEntity*>& members, const timer::time_point tick) -> bool
@@ -716,7 +819,31 @@ auto support(Bot& bot, PacketSystem& packets, const std::vector<CBattleEntity*>&
         return true;
     }
 
-    return PTarget != nullptr && (job == Job::WHM || job == Job::RDM) && buff(bot, packets, melee, StatusEffect::Haste, { SpellID::Haste }, tick);
+    if (PTarget == nullptr || (job != Job::WHM && job != Job::RDM))
+    {
+        return false;
+    }
+
+    // Haste is 40 MP: the main tank (or whoever the monster is on) gets it while half the MP is left, the other melee
+    // only with plenty to spare.
+    std::vector<CBattleEntity*> hasted;
+    if (PChar->GetMPP() >= kHasteAllMPP)
+    {
+        hasted = std::move(melee);
+    }
+    else if (PChar->GetMPP() >= kHasteTankMPP)
+    {
+        auto* PFront = mainTank(PChar);
+        if (PFront == nullptr)
+        {
+            PFront = PTarget->GetBattleTarget();
+        }
+        if (std::ranges::find(melee, PFront) != melee.end())
+        {
+            hasted.push_back(PFront);
+        }
+    }
+    return buff(bot, packets, hasted, StatusEffect::Haste, { SpellID::Haste }, tick);
 }
 
 // A notorious monster, three or more awake on the party, or the tank about to fall with the monster still fresh.
@@ -1203,7 +1330,32 @@ auto mainTank(CCharEntity* PChar) -> CBattleEntity*
     return PBest;
 }
 
-// Something for a White Mage to stand up for: someone below its cure threshold, dead, or with an ailment it can lift.
+// Whom the party leans on for cures: its White Mage, else a Red Mage or Scholar; the higher level breaks a tie.
+auto partyHealer(CCharEntity* PChar) -> CBattleEntity*
+{
+    if (PChar->PParty == nullptr)
+    {
+        return nullptr;
+    }
+
+    const auto rank = [](const Job job) { return job == Job::WHM ? 2 : job == Job::RDM || job == Job::SCH ? 1 : 0; };
+
+    CBattleEntity* PBest = nullptr;
+    for (auto* PMember : PChar->PParty->members)
+    {
+        if (PMember->isDead() || PMember->getZone() != PChar->getZone() || rank(PMember->GetMJob()) == 0)
+        {
+            continue;
+        }
+        if (PBest == nullptr || rank(PMember->GetMJob()) > rank(PBest->GetMJob()) ||
+            (rank(PMember->GetMJob()) == rank(PBest->GetMJob()) && PMember->GetMLevel() > PBest->GetMLevel()))
+        {
+            PBest = PMember;
+        }
+    }
+    return PBest;
+}
+
 // For !bot: this bot's hate on its target against whoever holds it.
 auto hateStatus(CCharEntity* PChar, CBattleEntity* PTarget) -> std::string
 {
@@ -1516,13 +1668,14 @@ auto helpStrangers(Bot& bot, PacketSystem& packets, const timer::time_point tick
             living.push_back(POther);
         }
     }
-    if (heal(bot, packets, living, 50, tick))
+    // The party's MP comes first: passers-by get what is spare.
+    if (PChar->GetMPP() >= kStrangerCureMPP && heal(bot, packets, living, 50, tick))
     {
         return true;
     }
 
     const bool town = (static_cast<uint16>(PChar->loc.zone->GetTypeMask()) & static_cast<uint16>(xi::ZoneType::City)) != 0;
-    if (town)
+    if (town || PChar->GetMPP() < kStrangerBuffMPP)
     {
         return false;
     }
@@ -1702,6 +1855,7 @@ auto act(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const bool tra
     {
         return false;
     }
+    learnNuke(bot, PChar, tick);
 
     const auto members = partyMembers(PChar);
     const auto job     = PChar->GetMJob();

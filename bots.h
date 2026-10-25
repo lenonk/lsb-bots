@@ -13,6 +13,7 @@
 #include "common/timer.h"
 #include "data/enums/zone.h"
 
+#include "map/entities/entity_id.h"
 #include "map/map_session.h"
 #include "map/lua/luautils.h"
 #include "map/packets/basic.h"
@@ -96,6 +97,17 @@ struct PlayerZone
     position_t pos{};   // where that player is
 };
 
+// A nuke a bot cast, kept until its next turn to see how much enmity it really added.
+struct NukeWatch
+{
+    EntityId          target;
+    SpellID           spell{};
+    int64             before{};   // the bot's enmity on the target when it cast
+    int64             beforeVE{}; // the volatile part, which decays while the spell is cast
+    int64             estimate{}; // what the spell's base and multiplier said it would add, unscaled
+    timer::time_point castAt{};
+};
+
 struct Bot
 {
     uint32                      charId{};
@@ -137,6 +149,8 @@ struct Bot
     uint32                      emoteTo{};
     timer::time_point           emoteAt{};
     std::map<uint64, timer::time_point> attempts; // per action and target, the earliest retry
+    std::optional<NukeWatch>    nukeWatch;       // the last nuke, until the enmity it added is known
+    std::deque<float>           nukeRatios;      // enmity added over estimated, for the last few nukes
 
     auto entity() const -> CCharEntity*;
 };
@@ -149,6 +163,8 @@ constexpr uint16 kSilentOil   = 4165;
 // Bots rest below these, and pullers wait for everyone to be above them.
 constexpr uint8 kRestHPP = 70;
 constexpr uint8 kRestMPP = 60;
+// The party's healer needs this much MP before another monster comes in.
+constexpr uint8 kHealerPullMPP = 85;
 
 // Lowercase, for matching names.
 inline auto lowerCase(std::string text) -> std::string
@@ -190,6 +206,7 @@ auto mainTank(CCharEntity* PChar) -> CBattleEntity*;
 auto pulledHate(CCharEntity* PChar, CBattleEntity* PTarget) -> bool;
 auto chasedOffTank(CCharEntity* PChar) -> bool;
 auto healingWanted(CCharEntity* PChar) -> bool;
+auto partyHealer(CCharEntity* PChar) -> CBattleEntity*;
 auto hateStatus(CCharEntity* PChar, CBattleEntity* PTarget) -> std::string;
 auto deadToRaise(CCharEntity* PChar) -> CCharEntity*;
 auto raiserNearby(CCharEntity* PChar) -> bool;

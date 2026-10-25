@@ -76,9 +76,7 @@ constexpr float kClaimSeconds = 5.0f;
 constexpr float kTankGrab     = 15.0f; // the main tank takes the pulled monster once it's this close
 constexpr float kPullerHome   = 8.0f;  // the puller this close to camp is back, and everyone joins in
 
-// Rough resting gains in percent a second, low so the estimate errs towards waiting: ticks every 10 s after the first 20 s.
-constexpr float kRestHPPerSecond = 0.5f;
-constexpr float kRestMPPerSecond = 0.4f;
+constexpr float kRestTick = 10.0f; // seconds between /heal ticks
 
 auto leaderOfParty(const CCharEntity* PChar) -> CBattleEntity*
 {
@@ -116,10 +114,45 @@ auto partyMobs(CCharEntity* PChar) -> std::vector<CMobEntity*>
     return mobs;
 }
 
+// HP and MP regained resting over the next seconds, as scripts/effects/healing.lua gives them: a tick every 10 s with
+// nothing on the first, then 10 HP and 12 MP, one more each tick (more MP with Clear Mind). Someone not resting yet is
+// counted from sitting down now. Refresh adds its own.
+auto restGain(CBattleEntity* PMember, const float seconds) -> std::pair<int32, int32>
+{
+    int   tickNo = 1;                // what the next tick's count will be
+    float wait   = kRestTick + 1.0f; // seconds until it comes, a second to sit down first
+    if (const auto* PHeal = PMember->StatusEffectContainer->GetStatusEffect(xi::StatusEffect::Healing))
+    {
+        tickNo            = PHeal->GetElapsedTickCount() + 1;
+        const float since = std::chrono::duration<float>(timer::now() - PHeal->GetStartTime()).count();
+        wait              = std::max(0.0f, static_cast<float>(tickNo) * kRestTick - since);
+    }
+
+    int32     hp    = 0;
+    int32     mp    = 0;
+    const int clear = 1 + PMember->getMod(xi::Mod::CLEAR_MIND);
+    for (; wait <= seconds; ++tickNo, wait += kRestTick)
+    {
+        if (tickNo >= 2)
+        {
+            hp += 10 + (tickNo - 2) + PMember->getMod(xi::Mod::HPHEAL);
+            mp += 12 + (tickNo - 2) * clear + PMember->getMod(xi::Mod::MPHEAL);
+        }
+    }
+
+    if (const auto* PRefresh = PMember->StatusEffectContainer->GetStatusEffect(xi::StatusEffect::Refresh);
+        PRefresh != nullptr && PRefresh->GetTickTime() > timer::duration::zero())
+    {
+        mp += PRefresh->GetPower() * static_cast<int32>(seconds / std::chrono::duration<float>(PRefresh->GetTickTime()).count());
+    }
+    return { hp, mp };
+}
+
 // By the time the puller is back, nobody would need to sit down: anyone resting is counted at what they'll have
-// regained, and Weakness only counts if it will still be on.
+// regained, and Weakness only counts if it will still be on. The party's healer needs more MP than the rest.
 auto readyBy(CCharEntity* PChar, const float seconds) -> bool
 {
+    auto* PHealer = partyHealer(PChar);
     const auto arrival = timer::now() + std::chrono::milliseconds(static_cast<int64>(seconds * 1000));
     for (auto* PMember : PChar->PParty->members)
     {
@@ -135,12 +168,14 @@ auto readyBy(CCharEntity* PChar, const float seconds) -> bool
         }
 
         const bool hasMP   = PMember->GetMaxMP() > 0;
-        // Casters sit down at every chance; melee only recover by being cured, unless they're actually resting.
+        // Casters without a pet out sit down at every chance; melee only recover by being cured, unless they're actually resting.
         const auto job     = PMember->GetMJob();
-        const bool resting = PMember->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::Healing) || isCaster(job) || job == xi::Job::RDM;
-        const float hp     = PMember->GetHPP() + (resting ? kRestHPPerSecond * seconds : 0.0f);
-        const float mp     = PMember->GetMPP() + (resting ? kRestMPPerSecond * seconds : 0.0f);
-        if (hp < kRestHPP || (hasMP && mp < kRestMPP))
+        const bool resting = PMember->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::Healing) ||
+                             ((isCaster(job) || job == xi::Job::RDM) && PMember->PPet == nullptr);
+        const auto [hpGain, mpGain] = resting ? restGain(PMember, seconds) : std::pair<int32, int32>{};
+        const float hp     = 100.0f * static_cast<float>(PMember->health.hp + hpGain) / static_cast<float>(std::max(1, PMember->GetMaxHP()));
+        const float mp     = hasMP ? 100.0f * static_cast<float>(PMember->health.mp + mpGain) / static_cast<float>(PMember->GetMaxMP()) : 100.0f;
+        if (hp < kRestHPP || (hasMP && mp < (PMember == PHealer ? kHealerPullMPP : kRestMPP)))
         {
             return false;
         }
@@ -503,7 +538,9 @@ auto pull(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CCharEntity* PLea
                 pull->stage    = Stage::Returning;
                 pull->stageAt  = tick;
                 pull->deadline = tick + runTime(distance(PChar->loc.p, camp)) * 2 + kSpareTime;
-                ShowInfoFmt("bots: {} pulled {}", PChar->getName(), PMob->getName());
+                const auto* PHealer = partyHealer(PChar);
+                ShowInfoFmt("bots: {} pulled {}{}", PChar->getName(), PMob->getName(),
+                            PHealer != nullptr ? fmt::format(" ({} at {}% MP)", PHealer->getName(), PHealer->GetMPP()) : std::string());
                 if (!pull->announced)
                 {
                     pull->announced = true;

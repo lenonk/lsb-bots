@@ -78,6 +78,7 @@ constexpr auto  kRaiseWait       = std::chrono::minutes(3);
 constexpr auto  kSettleTime      = std::chrono::seconds(2); // the leader has stopped for this long
 constexpr auto  kPlayerGoneGrace = std::chrono::seconds(20);
 constexpr uint32 kAttackKey      = 0x30000;
+constexpr uint32 kOutOfMPKey     = 0xB0000; // the mid-fight rest log, once a fight
 
 void sendAction(Bot& bot, PacketSystem& packets, const GP_CLI_COMMAND_ACTION_ACTIONID actionId, const CBaseEntity* PTarget, const uint32 param = 0)
 {
@@ -718,6 +719,11 @@ auto restInFight(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CBattleEnt
 
     if (PChar->GetMPP() < kFightRestMPP && !attacked && !wanted && canAct(PChar))
     {
+        if (throttle(bot, kOutOfMPKey, PTarget->id, std::chrono::minutes(5), tick))
+        {
+            ShowInfoFmt("bots: {} ({} {}) sits down at {}% MP fighting {} ({}% HP)", PChar->getName(), job == xi::Job::WHM ? "WHM" : "BLM", PChar->GetMLevel(),
+                        PChar->GetMPP(), PTarget->getName(), PTarget->GetHPP());
+        }
         PChar->PAI->PathFind->Clear();
         setResting(bot, packets, true);
         return true;
