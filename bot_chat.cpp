@@ -411,7 +411,11 @@ auto tidy(std::string text, const std::string& name) -> std::string
     std::ranges::replace(text, '\n', ' ');
     std::erase(text, '"');
 
-    // "Elowen: so who's pulling" - the model sometimes signs its line.
+    // "[Party] Elowen: so who's pulling" - the model sometimes signs its line, channel and all.
+    if (const auto tag = text.find("] "); text.starts_with('[') && tag != std::string::npos && tag < 12)
+    {
+        text.erase(0, tag + 2);
+    }
     if (const auto prefix = lower(name) + ":"; lower(text).starts_with(prefix))
     {
         text.erase(0, prefix.size());
@@ -722,7 +726,8 @@ auto describe(const Bot& bot, const bool places = false) -> std::string
     const auto nation = static_cast<std::size_t>(PChar->profile.nation);
 
     // Tuned on Qwen3-8B with ~/bg3mods/scratch/lsb-bots/chat-tune.py: a short prompt, no example lines (they get copied),
-    // who-said-what spelled out, and the subjob stated (it made one up otherwise).
+    // who-said-what spelled out, and the subjob stated (it made one up otherwise). On Qwen3-14B (model-compare.py) even
+    // listed abbreviations got copied: "np" opened most lines until the list went.
     const auto sub = PChar->GetSJob() != xi::Job::NONE && PChar->GetSLevel() > 0
                          ? fmt::format("{} subjob level {}", static_cast<std::size_t>(PChar->GetSJob()) < jobs.size() ? jobs[static_cast<std::size_t>(PChar->GetSJob())] : "?",
                                        PChar->GetSLevel())
@@ -733,7 +738,7 @@ auto describe(const Bot& bot, const bool places = false) -> std::string
                        "You: {8}\n\n"
                        "The chat so far is below. Lines from other people look like \"[Party] Name: text\"; your own earlier lines are your replies.\n"
                        "Write your next line in the chat: what you'd type back to the latest line, as yourself, in under 10 words.\n"
-                       "Real FFXI party chat is short and casual: lowercase, a word or two is fine, abbreviations like np, ty, lol, brb, k, wb.\n"
+                       "Real FFXI party chat is short and casual: lowercase, a word or two is fine, the usual abbreviations.\n"
                        "Don't repeat or echo what they said. Plain words only: no quotes, brackets, *actions*, emoji, or your name in front.\n"
                        "Stick to what's above; don't make up items, gil, numbers, plans, places or your past. Never say you're doing something\n"
                        "unless it says so above, and never mention being an AI. If someone wants to party, you've already sent them an invite.\n"
@@ -747,15 +752,38 @@ auto describe(const Bot& bot, const bool places = false) -> std::string
 void request(const Bot& bot, const uint8 kind, const std::string& to, const bool optional, const std::string& system, const std::string& prompt)
 {
     // The bot's own lines go back as its turns, everyone else's as the other side; the newest is the one being answered.
-    std::string messages = fmt::format(R"({{"role":"system","content":"{}"}})", jsonEscape(system));
+    // Lines in a row from one side are one turn, and the last turn is always the other side's: chat templates refuse
+    // two assistant turns at the end, and some drop the system prompt when no user turn follows it.
+    std::vector<std::pair<bool, std::string>> turns; // own, text
+    const auto add = [&](const bool own, const std::string& text)
+    {
+        if (!turns.empty() && turns.back().first == own)
+        {
+            turns.back().second += "\n" + text;
+        }
+        else
+        {
+            turns.emplace_back(own, text);
+        }
+    };
     for (const auto& line : memory[bot.charId])
     {
-        const bool own  = line.starts_with(kOwnPrefix);
-        messages       += fmt::format(R"(,{{"role":"{}","content":"{}"}})", own ? "assistant" : "user", jsonEscape(own ? line.substr(kOwnPrefix.size()) : line));
+        const bool own = line.starts_with(kOwnPrefix);
+        add(own, own ? line.substr(kOwnPrefix.size()) : line);
     }
     if (!prompt.empty())
     {
-        messages += fmt::format(R"(,{{"role":"user","content":"{}"}})", jsonEscape(prompt));
+        add(false, prompt);
+    }
+    if (turns.empty() || turns.back().first)
+    {
+        add(false, turns.empty() ? "(the chat is quiet)" : "(your turn to type)");
+    }
+
+    std::string messages = fmt::format(R"({{"role":"system","content":"{}"}})", jsonEscape(system));
+    for (const auto& [own, text] : turns)
+    {
+        messages += fmt::format(R"(,{{"role":"{}","content":"{}"}})", own ? "assistant" : "user", jsonEscape(text));
     }
 
     // Hosted APIs need a model name; llama-server ignores it.
@@ -765,7 +793,7 @@ void request(const Bot& bot, const uint8 kind, const std::string& to, const bool
         model = fmt::format(R"("model":"{}",)", jsonEscape(name));
     }
 
-    const auto body = fmt::format(R"({{{}"messages":[{}],"max_tokens":48,"temperature":0.8,"top_p":0.9,"min_p":0.05}})", model, messages);
+    const auto body = fmt::format(R"({{{}"messages":[{}],"max_tokens":48,"temperature":0.8,"top_p":0.9,"min_p":0.05,"presence_penalty":0.3}})", model, messages);
 
     std::lock_guard lock(shared.mutex);
     if (optional && shared.requests.size() >= kMaxPending)

@@ -41,6 +41,9 @@ point at a llama-server on `127.0.0.1:8085`. Bots answer tells, party and linksh
 yell when someone names them. With `LLM_ORDERS`, the model reads party chat for requests such as "Name pull",
 "camp here" or "can someone cure me", and C++ checks every plan before a bot acts on it. Without it, keywords decide.
 
+Tested with Qwen3-14B (Q4_K_M, about 9.5 GB of VRAM) on llama-server with `--reasoning-budget 0`. Qwen3-8B works too, but
+misreads more FFXI slang and invents more. Mistral NeMo 12B, Rocinante-X 12B and Gemma 3 12B did worse on chat or orders.
+
 `bot_pool.personality` holds each bot's personality. `bot_pool.chattiness` (0-100) sets how often it speaks unasked.
 
 ## Commands
