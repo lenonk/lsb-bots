@@ -100,6 +100,17 @@ auto rangedSkills(const xi::Job job) -> std::vector<SkillType>
     }
 }
 
+// What an instrument adds to the songs bots sing; all songs counts for each.
+auto songBonus(const CItemWeapon* PInstrument) -> int32
+{
+    int32 bonus = PInstrument->getModifier(xi::Mod::ALL_SONGS_EFFECT) * 6;
+    for (const auto mod : { xi::Mod::MINUET_EFFECT, xi::Mod::MARCH_EFFECT, xi::Mod::BALLAD_EFFECT, xi::Mod::PAEON_EFFECT, xi::Mod::ELEGY_EFFECT, xi::Mod::LULLABY_EFFECT })
+    {
+        bonus += PInstrument->getModifier(mod);
+    }
+    return bonus;
+}
+
 auto usable(const CItemEquipment* PItem, const xi::Job job, const uint8 level, const uint8 race) -> bool
 {
     // GmOnly is GM gear like the Judge's set; players can't get it.
@@ -149,6 +160,7 @@ auto planGear(const xi::Job job, const uint8 level, const uint8 race) -> std::ar
     const auto  ranged          = rangedSkills(job);
     int32       bestRanged      = -1;
     std::size_t bestRangedSkill = ranged.size();
+    int32       bestInstrument  = -1;
     std::vector<const CItemWeapon*> ammo;
 
     for (const auto& [id, PItem] : allEquipment())
@@ -181,6 +193,18 @@ auto planGear(const xi::Job job, const uint8 level, const uint8 race) -> std::ar
 
         if (const auto* PWeapon = dynamic_cast<const CItemWeapon*>(PItem); PWeapon && (slots & (1 << SLOT_RANGED)))
         {
+            // Without an instrument a bard holds one song instead of two. The one that boosts its songs most.
+            if (job == xi::Job::BRD && (PWeapon->getSkillType() == SkillType::StringInstrument || PWeapon->getSkillType() == SkillType::WindInstrument))
+            {
+                const auto score = songBonus(PWeapon) * 1000 + PWeapon->getReqLvl();
+                if (score > bestInstrument)
+                {
+                    bestInstrument    = score;
+                    plan[SLOT_RANGED] = id;
+                }
+                continue;
+            }
+
             const auto rank = static_cast<std::size_t>(std::ranges::find(ranged, PWeapon->getSkillType()) - ranged.begin());
             const auto score = PWeapon->getDelay() > 0 ? static_cast<int32>(PWeapon->getDamage() * 100000 / PWeapon->getDelay()) : -1;
             if (rank < ranged.size() && score >= 0 && (rank < bestRangedSkill || (rank == bestRangedSkill && score > bestRanged)))
@@ -240,7 +264,7 @@ auto planGear(const xi::Job job, const uint8 level, const uint8 race) -> std::ar
     }
 
     // Ammunition the ranged weapon fires (bows of either kind share arrows), hardest hitting first.
-    if (const auto* PRanged = xi::items::lookup<CItemWeapon>(plan[SLOT_RANGED]))
+    if (const auto* PRanged = xi::items::lookup<CItemWeapon>(plan[SLOT_RANGED]); PRanged != nullptr && !ranged.empty())
     {
         int32 bestAmmo = -1;
         for (const auto* PAmmo : ammo)

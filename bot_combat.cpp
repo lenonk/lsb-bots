@@ -37,7 +37,11 @@
 #include <algorithm>
 #include <cctype>
 #include <array>
+#include <cstring>
 #include <initializer_list>
+#include <iterator>
+#include <span>
+#include <string_view>
 #include <tuple>
 #include <list>
 #include <map>
@@ -93,12 +97,82 @@ constexpr auto kReleaseAfter = std::chrono::seconds(20);
 constexpr auto kChainOpens   = std::chrono::seconds(3); // a skill this soon after the last only reopens
 constexpr auto kChainHold    = std::chrono::seconds(6); // how long an opener is left for someone who can close it
 
+// While it's set, the bot is doing what it was told to, so what it was told to stop doesn't hold it back.
+struct Directed
+{
+    Bot&       bot;
+    const bool before;
+
+    explicit Directed(Bot& who, const bool on = true)
+    : bot(who)
+    , before(who.directed)
+    {
+        bot.directed = before || on;
+    }
+    ~Directed()
+    {
+        bot.directed = before;
+    }
+    Directed(const Directed&)            = delete;
+    Directed& operator=(const Directed&) = delete;
+};
+
+// The effect that shows a spell is still on: the spell table's, or for enfeebles (which it leaves out) what they give.
+auto keptEffect(const SpellID id) -> std::optional<StatusEffect>
+{
+    auto* PSpell = spell::GetSpell(id);
+    if (PSpell == nullptr)
+    {
+        return std::nullopt;
+    }
+    if (const auto effect = PSpell->statusEffect())
+    {
+        return *effect;
+    }
+    static const std::map<std::string, StatusEffect> enfeebles = {
+        { "dia", StatusEffect::Dia },          { "bio", StatusEffect::Bio },           { "slow", StatusEffect::Slow },
+        { "paralyze", StatusEffect::Paralysis }, { "blind", StatusEffect::Blindness }, { "silence", StatusEffect::Silence },
+        { "gravity", StatusEffect::Weight },   { "bind", StatusEffect::Bind },         { "poison", StatusEffect::Poison },
+        { "poisonga", StatusEffect::Poison },  { "addle", StatusEffect::Addle },       { "burn", StatusEffect::Burn },
+        { "frost", StatusEffect::Frost },      { "choke", StatusEffect::Choke },       { "rasp", StatusEffect::Rasp },
+        { "shock", StatusEffect::Shock },      { "drown", StatusEffect::Drown },       { "battlefield_elegy", StatusEffect::Elegy },
+        { "carnage_elegy", StatusEffect::Elegy }, { "foe_requiem", StatusEffect::Requiem },
+    };
+    const auto it = enfeebles.find(familyName(PSpell->getName()));
+    return it != enfeebles.end() ? std::optional(it->second) : std::nullopt;
+}
+
+auto isSleep(const std::string& family) -> bool
+{
+    return family.find("sleep") != std::string::npos || family.find("lullaby") != std::string::npos || family == "repose";
+}
+
+// Something the party told this bot to stop using.
+auto restrained(const Bot& bot, CSpell* PSpell) -> bool
+{
+    const auto& told = bot.directives;
+    if (bot.directed || (told.restraints == 0 && told.avoid.empty()))
+    {
+        return false;
+    }
+
+    const auto family  = familyName(PSpell->getName());
+    const bool hostile = (PSpell->getValidTarget() & TARGET_ENEMY) != 0;
+    const bool lasting = keptEffect(PSpell->getID()).has_value();
+    const bool sleep   = isSleep(family);
+    return std::ranges::contains(told.avoid, family) || ((told.restraints & kNoSleeps) && sleep) ||
+           ((told.restraints & kNoSongs) && PSpell->getSpellGroup() == SPELLGROUP_SONG) ||
+           ((told.restraints & kNoNukes) && hostile && !lasting && PSpell->getSkillType() == xi::SkillType::ElementalMagic) ||
+           ((told.restraints & kNoEnfeebles) && hostile && lasting && !sleep) ||
+           ((told.restraints & kNoBuffs) && !hostile && PSpell->getSkillType() == xi::SkillType::EnhancingMagic);
+}
+
 auto tryCast(Bot& bot, PacketSystem& packets, const SpellID id, CBattleEntity* PTarget, const timer::duration cooldown, const timer::time_point tick) -> bool
 {
     auto* PChar  = bot.entity();
     auto* PSpell = spell::GetSpell(id);
 
-    if (PSpell == nullptr || !spell::CanUseSpell(PChar, PSpell) || PChar->health.mp < PSpell->getMPCost() ||
+    if (PSpell == nullptr || !spell::CanUseSpell(PChar, PSpell) || restrained(bot, PSpell) || PChar->health.mp < PSpell->getMPCost() ||
         PChar->PRecastContainer->HasRecast(RECAST_MAGIC, static_cast<Recast>(id), 0s) || distance(PChar->loc.p, PTarget->loc.p) > kSpellRange ||
         !throttle(bot, static_cast<uint32>(id), PTarget->id, cooldown, tick))
     {
@@ -119,12 +193,22 @@ auto castBest(Bot& bot, PacketSystem& packets, const std::initializer_list<Spell
                                });
 }
 
+auto castLadder(Bot& bot, PacketSystem& packets, const std::vector<SpellID>& ladder, CBattleEntity* PTarget, const timer::duration cooldown, const timer::time_point tick) -> bool
+{
+    return std::ranges::any_of(ladder, [&](const SpellID id) { return tryCast(bot, packets, id, PTarget, cooldown, tick); });
+}
+
 auto tryAbility(Bot& bot, PacketSystem& packets, const uint16 id, CBattleEntity* PTarget, const timer::time_point tick) -> bool
 {
     auto* PChar    = bot.entity();
     auto* PAbility = ability::GetAbility(id);
+    const auto told = [&]
+    {
+        return !bot.directed && (((bot.directives.restraints & kNoProvoke) && id == ABILITY_PROVOKE) ||
+                                 (!bot.directives.avoid.empty() && std::ranges::contains(bot.directives.avoid, familyName(PAbility->getName()))));
+    };
 
-    if (PAbility == nullptr || !charutils::hasAbility(PChar, id) || PChar->PRecastContainer->HasRecast(RECAST_ABILITY, PAbility->getRecastId(), 0s) ||
+    if (PAbility == nullptr || !charutils::hasAbility(PChar, id) || told() || PChar->PRecastContainer->HasRecast(RECAST_ABILITY, PAbility->getRecastId(), 0s) ||
         !throttle(bot, kAbilityKey | id, PTarget->id, std::chrono::seconds(5), tick))
     {
         return false;
@@ -437,7 +521,7 @@ auto holdDamage(CCharEntity* PChar, CBattleEntity* PTarget) -> bool
 auto tryWeaponSkill(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::time_point tick) -> bool
 {
     auto* PChar = bot.entity();
-    if (holdDamage(PChar, PTarget))
+    if (holdDamage(PChar, PTarget) || (bot.directives.restraints & kNoWeaponSkills))
     {
         return false;
     }
@@ -602,7 +686,7 @@ std::map<uint64, EnfeebleTries> enfeebleTries;
 
 constexpr uint8 kEnfeebleTries = 3;
 
-auto enfeeble(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const StatusEffect effect, const std::initializer_list<SpellID> ladder, const timer::time_point tick) -> bool
+auto enfeeble(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const StatusEffect effect, const std::vector<SpellID>& ladder, const timer::time_point tick) -> bool
 {
     if (enfeebleTries.size() > 512)
     {
@@ -624,7 +708,7 @@ auto enfeeble(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const Sta
         return false;
     }
 
-    if (castBest(bot, packets, ladder, PTarget, std::chrono::seconds(8), tick))
+    if (castLadder(bot, packets, ladder, PTarget, std::chrono::seconds(8), tick))
     {
         ++tries.casts;
         tries.last = tick;
@@ -712,27 +796,378 @@ auto nuke(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::
     return std::ranges::any_of(kNukes, [&](const SpellID id) { return castNuke(bot, packets, id, PTarget, 1.0f, tick); });
 }
 
-auto sing(Bot& bot, PacketSystem& packets, const std::vector<CBattleEntity*>& members, const timer::time_point tick) -> bool
+constexpr float  kSongRadius  = 10.0f;                   // a song reaches everyone this close to the bard
+constexpr auto   kSongRefresh = std::chrono::seconds(30); // sung again with this little left
+constexpr auto   kSongWalk    = std::chrono::seconds(10); // a spot not reached by then is given up on for a while
+constexpr uint32 kSongWalkKey = 0x90000;
+
+struct Song
 {
-    auto* PChar     = bot.entity();
-    const bool mages = std::ranges::any_of(members, [](const CBattleEntity* PMember) { return PMember->GetMaxMP() > 0 && isSquishy(PMember->GetMJob()); });
+    SpellID      id;
+    StatusEffect effect;
+    uint16       tier; // tiers of one song stack; the same tier from anyone replaces it
+};
 
-    if (!PChar->StatusEffectContainer->HasStatusEffect(StatusEffect::Minuet) &&
-        castBest(bot, packets, { SpellID::Valor_Minuet_III, SpellID::Valor_Minuet_II, SpellID::Valor_Minuet }, PChar, std::chrono::seconds(10), tick))
+// Best first: a member gets the first ones the bard knows, as many as the bard can hold.
+constexpr std::array kMeleeSongs = {
+    Song{ SpellID::Victory_March, StatusEffect::March, 2 },     Song{ SpellID::Valor_Minuet_IV, StatusEffect::Minuet, 4 },
+    Song{ SpellID::Valor_Minuet_III, StatusEffect::Minuet, 3 }, Song{ SpellID::Advancing_March, StatusEffect::March, 1 },
+    Song{ SpellID::Valor_Minuet_II, StatusEffect::Minuet, 2 },  Song{ SpellID::Valor_Minuet, StatusEffect::Minuet, 1 },
+    Song{ SpellID::Armys_Paeon_V, StatusEffect::Paeon, 5 },     Song{ SpellID::Armys_Paeon_IV, StatusEffect::Paeon, 4 },
+    Song{ SpellID::Armys_Paeon_III, StatusEffect::Paeon, 3 },   Song{ SpellID::Armys_Paeon_II, StatusEffect::Paeon, 2 },
+    Song{ SpellID::Armys_Paeon, StatusEffect::Paeon, 1 },
+};
+constexpr std::array kMageSongs = {
+    Song{ SpellID::Mages_Ballad_II, StatusEffect::Ballad, 2 }, Song{ SpellID::Mages_Ballad, StatusEffect::Ballad, 1 },
+    Song{ SpellID::Armys_Paeon_V, StatusEffect::Paeon, 5 },    Song{ SpellID::Armys_Paeon_IV, StatusEffect::Paeon, 4 },
+    Song{ SpellID::Armys_Paeon_III, StatusEffect::Paeon, 3 },  Song{ SpellID::Armys_Paeon_II, StatusEffect::Paeon, 2 },
+    Song{ SpellID::Armys_Paeon, StatusEffect::Paeon, 1 },
+};
+
+// Every party song, so whichever one the party asks for is kept up like the bard's own picks.
+constexpr std::array kAllSongs = {
+    Song{ SpellID::Victory_March, StatusEffect::March, 2 },      Song{ SpellID::Advancing_March, StatusEffect::March, 1 },
+    Song{ SpellID::Valor_Minuet_IV, StatusEffect::Minuet, 4 },   Song{ SpellID::Valor_Minuet_III, StatusEffect::Minuet, 3 },
+    Song{ SpellID::Valor_Minuet_II, StatusEffect::Minuet, 2 },   Song{ SpellID::Valor_Minuet, StatusEffect::Minuet, 1 },
+    Song{ SpellID::Blade_Madrigal, StatusEffect::Madrigal, 2 },  Song{ SpellID::Sword_Madrigal, StatusEffect::Madrigal, 1 },
+    Song{ SpellID::Mages_Ballad_II, StatusEffect::Ballad, 2 },   Song{ SpellID::Mages_Ballad, StatusEffect::Ballad, 1 },
+    Song{ SpellID::Armys_Paeon_V, StatusEffect::Paeon, 5 },      Song{ SpellID::Armys_Paeon_IV, StatusEffect::Paeon, 4 },
+    Song{ SpellID::Armys_Paeon_III, StatusEffect::Paeon, 3 },    Song{ SpellID::Armys_Paeon_II, StatusEffect::Paeon, 2 },
+    Song{ SpellID::Armys_Paeon, StatusEffect::Paeon, 1 },        Song{ SpellID::Knights_Minne_IV, StatusEffect::Minne, 4 },
+    Song{ SpellID::Knights_Minne_III, StatusEffect::Minne, 3 },  Song{ SpellID::Knights_Minne_II, StatusEffect::Minne, 2 },
+    Song{ SpellID::Knights_Minne, StatusEffect::Minne, 1 },      Song{ SpellID::Dragonfoe_Mambo, StatusEffect::Mambo, 2 },
+    Song{ SpellID::Sheepfoe_Mambo, StatusEffect::Mambo, 1 },     Song{ SpellID::Archers_Prelude, StatusEffect::Prelude, 2 },
+    Song{ SpellID::Hunters_Prelude, StatusEffect::Prelude, 1 },
+};
+
+constexpr std::array<std::pair<StatusEffect, const char*>, 8> kSongDoes = { {
+    { StatusEffect::Minuet, "attack" },       { StatusEffect::March, "attack speed" },  { StatusEffect::Madrigal, "accuracy" },
+    { StatusEffect::Ballad, "MP over time" }, { StatusEffect::Paeon, "HP over time" },  { StatusEffect::Minne, "defense" },
+    { StatusEffect::Mambo, "evasion" },       { StatusEffect::Prelude, "ranged accuracy" },
+} };
+
+auto songOf(const SpellID id) -> const Song*
+{
+    const auto it = std::ranges::find(kAllSongs, id, &Song::id);
+    return it != kAllSongs.end() ? &*it : nullptr;
+}
+
+// Two songs on each member with an instrument, one without (as the song script counts them).
+auto songsHeld(CCharEntity* PChar) -> int
+{
+    const auto* PInstrument = dynamic_cast<CItemWeapon*>(PChar->getEquip(SLOT_RANGED));
+    const bool  instrument  = PInstrument != nullptr &&
+                             (PInstrument->getSkillType() == xi::SkillType::StringInstrument || PInstrument->getSkillType() == xi::SkillType::WindInstrument);
+    return std::max(1, (instrument ? 2 : 1) + PChar->getMod(xi::Mod::MAXIMUM_SONGS_BONUS));
+}
+
+// Whom a standing instruction covers.
+auto covers(const KeepUp& keep, const CBattleEntity* PMember, const CCharEntity* PSelf) -> bool
+{
+    switch (keep.who)
     {
+        case KeepFor::Self: return PMember == PSelf;
+        case KeepFor::Member: return PMember->id == keep.memberId;
+        case KeepFor::Melee: return !isSquishy(PMember->GetMJob());
+        case KeepFor::Mages: return isSquishy(PMember->GetMJob());
+        case KeepFor::Everyone: return true;
+        case KeepFor::Monster: return false;
+    }
+    return false;
+}
+
+// One member's songs: what the party asked for first (everyone's, when the bard can't single anyone out), then the
+// bard's own picks unless it was told to stop singing. Asked-for songs go into asked.
+auto songsFor(const Bot& bot, const CBattleEntity* PMember, const bool mage, const bool shared, const int held, std::vector<const Song*>& asked)
+    -> std::vector<const Song*>
+{
+    auto*                    PBard = bot.entity();
+    std::vector<const Song*> songs;
+    const auto add = [&](const SpellID id)
+    {
+        if (std::ssize(songs) < held && !std::ranges::contains(songs, id, &Song::id))
+        {
+            songs.push_back(songOf(id));
+        }
+    };
+
+    for (const auto& keep : bot.directives.keep)
+    {
+        if (keep.ability != 0 || (!shared && !covers(keep, PMember, PBard)))
+        {
+            continue;
+        }
+        const auto known = std::ranges::find_if(keep.ladder, [&](const SpellID id) { return songOf(id) != nullptr && spell::CanUseSpell(PBard, id); });
+        if (known != keep.ladder.end())
+        {
+            add(*known);
+            if (!std::ranges::contains(asked, *known, &Song::id))
+            {
+                asked.push_back(songOf(*known));
+            }
+        }
+    }
+
+    if ((bot.directives.restraints & kNoSongs) == 0)
+    {
+        for (const auto& song : mage ? std::span<const Song>(kMageSongs) : std::span<const Song>(kMeleeSongs))
+        {
+            if (spell::CanUseSpell(PBard, song.id))
+            {
+                add(song.id);
+            }
+        }
+    }
+    return songs;
+}
+
+// Time left on a song of this kind and tier, whoever sang it.
+auto songLeft(CBattleEntity* PMember, const Song& song, const timer::time_point tick) -> timer::duration
+{
+    timer::duration left{};
+    PMember->StatusEffectContainer->ForEachEffect(
+        [&](CStatusEffect& effect)
+        {
+            if (effect.GetStatusID() == song.effect && effect.GetTier() == song.tier)
+            {
+                left = std::max(left, effect.GetStartTime() + effect.GetDuration() - tick);
+            }
+        });
+    return left;
+}
+
+// Melee get March and Minuet, mages Ballad. A song reaches everyone near the bard, so it walks over to the members a song
+// is for, to a spot nobody who wants other songs is near; Pianissimo narrows a song to one member when they're bunched up.
+auto sing(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::time_point tick) -> bool
+{
+    auto*       PChar      = bot.entity();
+    const int   held       = songsHeld(PChar);
+    const bool  narrowed   = PChar->StatusEffectContainer->HasStatusEffect(StatusEffect::Pianissimo);
+    const auto* PPiano     = ability::GetAbility(ABILITY_PIANISSIMO);
+    const bool  hasPiano   = PPiano != nullptr && charutils::hasAbility(PChar, ABILITY_PIANISSIMO);
+    const bool  pianissimo = hasPiano && (narrowed || !PChar->PRecastContainer->HasRecast(RECAST_ABILITY, PPiano->getRecastId(), 0s));
+
+    // Anyone a song sung from a reachable spot could land on.
+    std::vector<CBattleEntity*> others;
+    std::ranges::copy_if(partyMembersAll(PChar), std::back_inserter(others),
+                         [&](const CBattleEntity* PMember)
+                         { return PMember != PChar && !PMember->isDead() && distance(PChar->loc.p, PMember->loc.p) <= kSpellRange + kSongRadius; });
+    const bool alone = others.empty();
+    if (alone)
+    {
+        others.push_back(PChar);
+    }
+
+    // Without Pianissimo nobody can be left out, so everyone gets what most of the party wants.
+    const auto mages      = alone ? 0 : std::ranges::count_if(others, [](const CBattleEntity* PMember) { return isSquishy(PMember->GetMJob()); });
+    const bool mostlyMage = 2 * mages > std::ssize(others);
+
+    struct Wants
+    {
+        CBattleEntity*           member;
+        std::vector<const Song*> songs;
+    };
+    std::vector<Wants>       wants;
+    std::vector<const Song*> asked;
+    for (auto* PMember : others)
+    {
+        wants.push_back({ PMember, songsFor(bot, PMember, hasPiano ? !alone && isSquishy(PMember->GetMJob()) : mostlyMage, !hasPiano, held, asked) });
+    }
+
+    struct Plan
+    {
+        const Song*    song{};
+        CBattleEntity* PTo{}; // a Pianissimo target; none for everyone around the bard
+        position_t     spot{};
+        int            score{};
+    };
+    Plan best;
+
+    const auto walkBlocked = [&](const Song* song)
+    {
+        const auto it = bot.attempts.find(kSongWalkKey | static_cast<uint32>(song->id));
+        return it != bot.attempts.end() && tick < it->second;
+    };
+
+    std::vector<const Song*> considered;
+    for (const auto& want : wants)
+    {
+        for (const auto* song : want.songs)
+        {
+            if (std::ranges::contains(considered, song) || PChar->PRecastContainer->HasRecast(RECAST_MAGIC, static_cast<Recast>(song->id), 0s))
+            {
+                continue;
+            }
+            considered.push_back(song);
+
+            // Missing counts double against running low.
+            std::vector<std::pair<CBattleEntity*, int>> needers;
+            std::vector<CBattleEntity*>                 refusers;
+            for (const auto& other : wants)
+            {
+                if (!std::ranges::contains(other.songs, song))
+                {
+                    if (other.member != PChar)
+                    {
+                        refusers.push_back(other.member);
+                    }
+                }
+                else if (const auto left = songLeft(other.member, *song, tick); left < kSongRefresh)
+                {
+                    needers.emplace_back(other.member, left <= 0s ? 2 : 1);
+                }
+            }
+            if (needers.empty())
+            {
+                continue;
+            }
+
+            // Everyone at once, from the middle of them or beside one of them, with nobody else in reach.
+            if (!narrowed && !walkBlocked(song))
+            {
+                position_t middle{};
+                for (const auto& [PMember, weight] : needers)
+                {
+                    middle.x += PMember->loc.p.x / needers.size();
+                    middle.y += PMember->loc.p.y / needers.size();
+                    middle.z += PMember->loc.p.z / needers.size();
+                }
+                std::vector<position_t> spots{ middle };
+                for (const auto& [PMember, weight] : needers)
+                {
+                    spots.push_back(PMember->loc.p);
+                }
+
+                for (const auto& spot : spots)
+                {
+                    if (std::ranges::any_of(refusers, [&](const CBattleEntity* PRefuser) { return distance(PRefuser->loc.p, spot) <= kSongRadius + 1.0f; }))
+                    {
+                        continue;
+                    }
+                    int score = 0;
+                    for (const auto& [PMember, weight] : needers)
+                    {
+                        score += distance(PMember->loc.p, spot) <= kSongRadius - 1.5f ? weight : 0;
+                    }
+                    if (score > best.score)
+                    {
+                        best = { song, nullptr, spot, score };
+                    }
+                }
+            }
+
+            // One member at a time.
+            if (pianissimo)
+            {
+                for (const auto& [PMember, weight] : needers)
+                {
+                    if (PMember != PChar && weight > best.score)
+                    {
+                        best = { song, PMember, {}, weight };
+                    }
+                }
+            }
+        }
+    }
+
+    if (best.song == nullptr)
+    {
+        return false;
+    }
+    const Directed directed(bot, std::ranges::contains(asked, best.song));
+
+    // Walking over, unless the bard has hate and belongs with the tank.
+    const auto walk = [&](const position_t& to, const float within)
+    {
+        if (PTarget != nullptr && (pulledHate(PChar, PTarget) || chasedOffTank(PChar)))
+        {
+            return false;
+        }
+        if (bot.songWalk != best.song->id || tick > bot.songWalkUntil)
+        {
+            bot.songWalk      = best.song->id;
+            bot.songWalkSince = tick;
+        }
+        else if (tick - bot.songWalkSince > kSongWalk)
+        {
+            bot.attempts[kSongWalkKey | static_cast<uint32>(best.song->id)] = tick + std::chrono::seconds(30);
+            return false;
+        }
+        bot.songWalkUntil = tick + std::chrono::seconds(1);
+        walkTo(PChar, to, within, tick);
         return true;
-    }
+    };
 
-    // A bard holds two songs; a third would knock the oldest off. Ballad for mages, March (Paeon before it's learnt) otherwise.
-    if (mages)
+    if (best.PTo == nullptr)
     {
-        return !PChar->StatusEffectContainer->HasStatusEffect(StatusEffect::Ballad) &&
-               castBest(bot, packets, { SpellID::Mages_Ballad_II, SpellID::Mages_Ballad }, PChar, std::chrono::seconds(10), tick);
+        if (distance(PChar->loc.p, best.spot) > 1.5f)
+        {
+            return walk(best.spot, 1.0f);
+        }
+        return tryCast(bot, packets, best.song->id, PChar, std::chrono::seconds(3), tick);
     }
 
-    return !PChar->StatusEffectContainer->HasStatusEffect(StatusEffect::March) && !PChar->StatusEffectContainer->HasStatusEffect(StatusEffect::Paeon) &&
-           castBest(bot, packets, { SpellID::Victory_March, SpellID::Advancing_March, SpellID::Armys_Paeon_III, SpellID::Armys_Paeon_II, SpellID::Armys_Paeon },
-                    PChar, std::chrono::seconds(10), tick);
+    if (!narrowed)
+    {
+        return tryAbility(bot, packets, ABILITY_PIANISSIMO, PChar, tick);
+    }
+    if (distance(PChar->loc.p, best.PTo->loc.p) > kSpellRange - 2.0f)
+    {
+        return walk(best.PTo->loc.p, kSpellRange - 5.0f);
+    }
+    return tryCast(bot, packets, best.song->id, best.PTo, std::chrono::seconds(3), tick);
+}
+
+// Elegy slows the monster for the rest of the fight: once, early, while hate allows.
+auto elegy(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::time_point tick) -> bool
+{
+    auto* PChar = bot.entity();
+    return PTarget->GetHPP() > 50 && !asleep(PTarget) && !PTarget->StatusEffectContainer->HasStatusEffect(StatusEffect::Elegy) && !holdDamage(PChar, PTarget) &&
+           castBest(bot, packets, { SpellID::Carnage_Elegy, SpellID::Battlefield_Elegy }, PTarget, std::chrono::seconds(20), tick);
+}
+
+auto isAvatar(const KeepUp& keep) -> bool
+{
+    const auto* PSpell = keep.ladder.empty() ? nullptr : spell::GetSpell(keep.ladder.front());
+    return PSpell != nullptr && PSpell->getSpellGroup() == SPELLGROUP_SUMMONING;
+}
+
+// What the party told this bot to keep up, ahead of anything it would pick itself: buffs on members and enfeebles on the
+// monster. Songs, rolls and avatars are kept by sing(), upkeep() and pets().
+auto directed(Bot& bot, PacketSystem& packets, const std::vector<CBattleEntity*>& members, CBattleEntity* PTarget, const timer::time_point tick) -> bool
+{
+    auto*          PChar = bot.entity();
+    const Directed directing(bot);
+    for (const auto& keep : bot.directives.keep)
+    {
+        if (keep.ladder.empty() || songOf(keep.ladder.front()) != nullptr || isAvatar(keep))
+        {
+            continue;
+        }
+        const auto effect = keptEffect(keep.ladder.front());
+        if (!effect)
+        {
+            continue;
+        }
+
+        if (keep.who == KeepFor::Monster)
+        {
+            if (PTarget != nullptr && enfeeble(bot, packets, PTarget, *effect, keep.ladder, tick))
+            {
+                return true;
+            }
+            continue;
+        }
+        for (auto* PMember : members)
+        {
+            if (covers(keep, PMember, PChar) && !PMember->StatusEffectContainer->HasStatusEffect(*effect) &&
+                castLadder(bot, packets, keep.ladder, PMember, std::chrono::seconds(20), tick))
+            {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 struct Cleanse
@@ -880,6 +1315,16 @@ auto desperate(CCharEntity* PChar, CBattleEntity* PTarget) -> bool
     return PHurt != nullptr && PHurt->GetHPP() < 30 && PMob->GetHPP() > 40;
 }
 
+// Fighter's Roll through Tactician's Roll: their effects run in the same order as the abilities.
+auto rollStatus(const uint16 ability) -> std::optional<StatusEffect>
+{
+    if (ability < ABILITY_FIGHTERS_ROLL || ability > ABILITY_TACTICIANS_ROLL)
+    {
+        return std::nullopt;
+    }
+    return static_cast<StatusEffect>(static_cast<uint16>(StatusEffect::FightersRoll) + ability - ABILITY_FIGHTERS_ROLL);
+}
+
 // Scholar arts and Sublimation, Corsair rolls, Geomancer colures: the buffs a job keeps going between fights and in them.
 auto upkeep(Bot& bot, PacketSystem& packets, const std::vector<CBattleEntity*>& members, CBattleEntity* PTarget, const timer::time_point tick) -> bool
 {
@@ -903,7 +1348,7 @@ auto upkeep(Bot& bot, PacketSystem& packets, const std::vector<CBattleEntity*>& 
                (effect(StatusEffect::SublimationComplete) && PChar->GetMPP() < 75 && self(ABILITY_SUBLIMATION));
     }
 
-    if (job == Job::GEO && !town)
+    if (job == Job::GEO && !town && (bot.directives.restraints & kNoBuffs) == 0)
     {
         // Indi- on itself always: Refresh for a caster-heavy party, else attack, defence, regen, accuracy.
         if (!effect(StatusEffect::ColureActive) &&
@@ -971,8 +1416,27 @@ auto upkeep(Bot& bot, PacketSystem& packets, const std::vector<CBattleEntity*>& 
                                                                                      { ABILITY_HEALERS_ROLL, StatusEffect::HealersRoll },
                                                                                      { ABILITY_CHAOS_ROLL, StatusEffect::ChaosRoll },
                                                                                      { ABILITY_CORSAIRS_ROLL, StatusEffect::CorsairsRoll } } };
-    const auto& wanted = melee ? meleeRolls : magicRolls;
-    const auto  most   = job == Job::COR ? 2 : 1;
+    const auto most = job == Job::COR ? 2 : 1;
+
+    // Rolls the party asked for first, then its own picks unless it was told to stop buffing.
+    std::vector<std::pair<uint16, StatusEffect>> wanted;
+    for (const auto& keep : bot.directives.keep)
+    {
+        if (const auto asked = rollStatus(keep.ability))
+        {
+            wanted.emplace_back(keep.ability, *asked);
+        }
+    }
+    if ((bot.directives.restraints & kNoBuffs) == 0)
+    {
+        for (const auto& roll : melee ? meleeRolls : magicRolls)
+        {
+            if (!std::ranges::contains(wanted, roll.first, &std::pair<uint16, StatusEffect>::first))
+            {
+                wanted.push_back(roll);
+            }
+        }
+    }
 
     // The first rolls on the list it knows, up to how many it can hold.
     int up = 0;
@@ -1003,6 +1467,10 @@ auto emergency(Bot& bot, PacketSystem& packets, const std::vector<CBattleEntity*
         }
         return used;
     };
+    if (bot.directives.restraints & kNoTwoHours)
+    {
+        return PChar->GetMJob() == Job::RDM && PChar->GetMPP() < 25 && PChar->GetHPP() > 70 && tryAbility(bot, packets, ABILITY_CONVERT, PChar, tick);
+    }
 
     switch (PChar->GetMJob())
     {
@@ -1057,7 +1525,7 @@ constexpr uint8 kTankHandOverHPP = 40;
 auto shoot(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::time_point tick) -> bool
 {
     auto* PChar = bot.entity();
-    if (!isRanged(PChar) || holdDamage(PChar, PTarget) || distance(PChar->loc.p, PTarget->loc.p) > PChar->GetRangedAttackRange() ||
+    if (!isRanged(PChar) || (bot.directives.restraints & kNoRanged) || holdDamage(PChar, PTarget) || distance(PChar->loc.p, PTarget->loc.p) > PChar->GetRangedAttackRange() ||
         !throttle(bot, kShootKey, PTarget->id, std::chrono::seconds(1), tick))
     {
         return false;
@@ -1096,6 +1564,13 @@ auto pets(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::
 {
     auto* PChar = bot.entity();
     auto* PPet  = PChar->PPet;
+
+    // Told to put it away: a summoner sends its avatar home; other pets are left be.
+    const auto avatar = std::ranges::find_if(bot.directives.keep, isAvatar);
+    if ((bot.directives.restraints & kNoPets) && avatar == bot.directives.keep.end())
+    {
+        return PChar->GetMJob() == Job::SMN && PPet != nullptr && tryAbility(bot, packets, ABILITY_RELEASE, PChar, tick);
+    }
 
     if (PChar->GetMJob() == Job::DRG)
     {
@@ -1166,7 +1641,24 @@ auto pets(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::
         return false;
     }
 
-    if (PTarget == nullptr)
+    // An avatar the party asked for stays out between fights too; a different one goes home first.
+    if (avatar != bot.directives.keep.end())
+    {
+        if (PPet != nullptr && familyName(PPet->getName()) != familyName(spell::GetSpell(avatar->ladder.front())->getName()))
+        {
+            return tryAbility(bot, packets, ABILITY_RELEASE, PChar, tick);
+        }
+        if (PPet == nullptr)
+        {
+            const Directed directing(bot);
+            return castLadder(bot, packets, avatar->ladder, PChar, std::chrono::seconds(10), tick);
+        }
+        if (PTarget == nullptr)
+        {
+            return false;
+        }
+    }
+    else if (PTarget == nullptr)
     {
         // Perpetuation eats MP, so the avatar goes home between fights.
         return PPet != nullptr && tick - bot.foughtAt > kReleaseAfter && tryAbility(bot, packets, ABILITY_RELEASE, PChar, tick);
@@ -1294,12 +1786,38 @@ auto tank(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::
 
 } // namespace
 
-// The best tank in the party, players included: PLD, then NIN or RUN, then WAR; the higher level breaks a tie.
+// Main tanks the party named, by party.
+std::map<uint32, uint32> tankChoices;
+
+void setMainTank(const uint32 partyId, const uint32 memberId)
+{
+    tankChoices[partyId] = memberId;
+}
+
+auto chosenTank(const uint32 partyId) -> uint32
+{
+    const auto it = tankChoices.find(partyId);
+    return it != tankChoices.end() ? it->second : 0;
+}
+
+// Whoever the party named, else the best tank in it, players included: PLD, then NIN or RUN, then WAR; the higher level
+// breaks a tie.
 auto mainTank(CCharEntity* PChar) -> CBattleEntity*
 {
     if (PChar->PParty == nullptr)
     {
         return nullptr;
+    }
+
+    if (const auto chosen = chosenTank(PChar->PParty->GetPartyID()); chosen != 0)
+    {
+        for (auto* PMember : PChar->PParty->members)
+        {
+            if (PMember->id == chosen && !PMember->isDead() && PMember->getZone() == PChar->getZone())
+            {
+                return PMember;
+            }
+        }
     }
 
     const auto rank = [](const Job job)
@@ -1542,6 +2060,10 @@ auto jobAbilities(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const
     if ((isTank(PChar->GetMJob()) || isTank(PChar->GetSJob())) && tank(bot, packets, PTarget, tick))
     {
         return true;
+    }
+    if (bot.directives.restraints & kNoAbilities)
+    {
+        return false;
     }
 
     auto*      PTank    = mainTank(PChar);
@@ -1856,6 +2378,7 @@ auto act(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const bool tra
         return false;
     }
     learnNuke(bot, PChar, tick);
+    directivesOf(bot);
 
     const auto members = partyMembers(PChar);
     const auto job     = PChar->GetMJob();
@@ -1960,7 +2483,12 @@ auto act(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const bool tra
         return true;
     }
 
-    if (job == Job::BRD && sing(bot, packets, members, tick))
+    if (directed(bot, packets, members, PTarget, tick))
+    {
+        return true;
+    }
+
+    if (job == Job::BRD && sing(bot, packets, PTarget, tick))
     {
         return true;
     }
@@ -2011,6 +2539,8 @@ auto act(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const bool tra
     {
         case Job::RDM:
             return debuff(bot, packets, PTarget, tick) || (PChar->GetMPP() > 50 && nuke(bot, packets, PTarget, std::chrono::seconds(15), tick));
+        case Job::BRD:
+            return elegy(bot, packets, PTarget, tick);
         case Job::WHM:
             // Dia always; Slow, Paralyze and Silence only when there's no red mage to do it and MP to spare.
             if (enfeeble(bot, packets, PTarget, StatusEffect::Dia, { SpellID::Dia_II, SpellID::Dia }, tick))
@@ -2176,6 +2706,27 @@ auto followOrder(Bot& bot, PacketSystem& packets, const timer::time_point tick) 
             }
             return false;
         }
+        case OrderKind::Ability:
+        {
+            // On the monster if it's that kind of ability, else on itself; a recast still running waits until the order expires.
+            auto*          PAbility = ability::GetAbility(order.ability);
+            CBattleEntity* PTo      = PAbility != nullptr && (PAbility->getValidTarget() & TARGET_ENEMY) ? PMonster : PChar;
+            if (PTo == nullptr)
+            {
+                return false;
+            }
+            if (!canAct(PChar))
+            {
+                return true;
+            }
+            const Directed directing(bot);
+            if (tryAbility(bot, packets, order.ability, PTo, tick))
+            {
+                bot.order.reset();
+                return true;
+            }
+            return false;
+        }
         case OrderKind::Attack:
             if (PMonster != nullptr)
             {
@@ -2228,6 +2779,265 @@ auto followOrder(Bot& bot, PacketSystem& packets, const timer::time_point tick) 
 
     bot.order.reset();
     return false;
+}
+
+auto familyName(const std::string& name) -> std::string
+{
+    std::string key;
+    for (const char c : name)
+    {
+        if (c == ' ' || c == '-')
+        {
+            key += '_';
+        }
+        else if (c != '\'' && c != ':')
+        {
+            key += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+    }
+    for (const std::string_view tier : { "_v", "_iv", "_iii", "_ii" })
+    {
+        if (key.ends_with(tier))
+        {
+            key.resize(key.size() - tier.size());
+            break;
+        }
+    }
+    return key;
+}
+
+auto canKeepUp(const SpellID id) -> bool
+{
+    const auto* PSpell = spell::GetSpell(id);
+    return songOf(id) != nullptr || keptEffect(id).has_value() || (PSpell != nullptr && PSpell->getSpellGroup() == SPELLGROUP_SUMMONING);
+}
+
+auto songDoes(const SpellID id) -> const char*
+{
+    const auto* song = songOf(id);
+    const auto  it   = song != nullptr ? std::ranges::find(kSongDoes, song->effect, &std::pair<StatusEffect, const char*>::first) : kSongDoes.end();
+    return it != kSongDoes.end() ? it->second : nullptr;
+}
+
+auto rollDoes(const uint16 abilityId) -> const char*
+{
+    // Fighter's Roll through Tactician's Roll, in ability order.
+    static constexpr std::array<const char*, 25> does = {
+        "double attack",    "subtle blow", "cure potency received", "magic attack", "magic accuracy", "critical hit rate", "defense",
+        "attack",           "pet attack",  "less spell interruption", "accuracy",   "Store TP",       "evasion",           "pet accuracy",
+        "refresh",          "magic defense", "experience points",    "pet magic attack", "regen",      "conserve MP",       "movement speed",
+        "fast cast",        "snapshot",    "attack speed",          "regain",
+    };
+    return rollStatus(abilityId) ? does[abilityId - ABILITY_FIGHTERS_ROLL] : nullptr;
+}
+
+auto songsHeldBy(CCharEntity* PChar) -> int
+{
+    return songsHeld(PChar);
+}
+
+auto directivesOf(Bot& bot) -> Directives&
+{
+    const auto*  PChar   = bot.entity();
+    const uint32 partyId = PChar != nullptr && PChar->PParty != nullptr ? PChar->PParty->GetPartyID() : 0;
+    if (bot.directives.partyId != partyId)
+    {
+        bot.directives = Directives{ .partyId = partyId };
+    }
+    return bot.directives;
+}
+
+constexpr std::array<std::pair<uint16, const char*>, 11> kRestraintNames = { {
+    { kNoNukes, "nukes" },        { kNoWeaponSkills, "weapon skills" }, { kNoEnfeebles, "enfeebles" }, { kNoSleeps, "sleep" },
+    { kNoSongs, "songs" },        { kNoPets, "pets" },                  { kNoProvoke, "provoke" },     { kNoRanged, "ranged attacks" },
+    { kNoAbilities, "job abilities" }, { kNoTwoHours, "two-hours" },    { kNoBuffs, "buffs" },
+} };
+
+auto restraintFor(const std::string& word) -> uint16
+{
+    static const std::map<std::string, uint16> words = [] {
+        std::map<std::string, uint16> out;
+        const auto add = [&](const uint16 flag, const std::initializer_list<const char*> names)
+        {
+            for (const auto* name : names)
+            {
+                out.emplace(familyName(name), flag);
+            }
+        };
+        add(kNoNukes, { "nukes", "nuke", "nuking", "magic damage" });
+        add(kNoWeaponSkills, { "weapon skills", "weapon skill", "weaponskills", "ws" });
+        add(kNoEnfeebles, { "enfeebles", "enfeeble", "enfeebling", "debuffs", "debuff" });
+        add(kNoSleeps, { "sleep", "sleeps", "sleeping", "sleeping adds" });
+        add(kNoSongs, { "songs", "song", "singing" });
+        add(kNoPets, { "pets", "pet", "avatar", "avatars", "wyvern" });
+        add(kNoProvoke, { "provoke", "voke", "provoking" });
+        add(kNoRanged, { "ranged attacks", "ranged attack", "ranged", "shooting", "shots" });
+        add(kNoAbilities, { "job abilities", "job ability", "abilities", "ja" });
+        add(kNoTwoHours, { "two-hours", "two hours", "two-hour", "2hr", "2hrs", "2 hour" });
+        add(kNoBuffs, { "buffs", "buff", "buffing", "rolls" });
+        return out;
+    }();
+    const auto it = words.find(familyName(word));
+    return it != words.end() ? it->second : 0;
+}
+
+auto songLadder(const std::string& words) -> std::vector<SpellID>
+{
+    // The longest phrase found wins, so "attack speed" is a March and "ranged accuracy" a Prelude.
+    static constexpr std::array<std::pair<const char*, StatusEffect>, 20> phrases = { {
+        { "minuet", StatusEffect::Minuet },    { "attack", StatusEffect::Minuet },       { "march", StatusEffect::March },
+        { "haste", StatusEffect::March },      { "attack speed", StatusEffect::March },  { "madrigal", StatusEffect::Madrigal },
+        { "accuracy", StatusEffect::Madrigal }, { "acc", StatusEffect::Madrigal },      { "ballad", StatusEffect::Ballad },
+        { "mp", StatusEffect::Ballad },        { "refresh", StatusEffect::Ballad },      { "paeon", StatusEffect::Paeon },
+        { "regen", StatusEffect::Paeon },      { "minne", StatusEffect::Minne },         { "defense", StatusEffect::Minne },
+        { "mambo", StatusEffect::Mambo },      { "evasion", StatusEffect::Mambo },       { "prelude", StatusEffect::Prelude },
+        { "ranged accuracy", StatusEffect::Prelude }, { "racc", StatusEffect::Prelude },
+    } };
+
+    std::string text;
+    for (const char c : words)
+    {
+        text += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    const auto said = [&](const std::string_view phrase)
+    {
+        for (auto at = text.find(phrase); at != std::string::npos; at = text.find(phrase, at + 1))
+        {
+            const bool startOk = at == 0 || !std::isalpha(static_cast<unsigned char>(text[at - 1]));
+            const bool endOk   = at + phrase.size() >= text.size() || !std::isalpha(static_cast<unsigned char>(text[at + phrase.size()]));
+            if (startOk && endOk)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    std::optional<StatusEffect> effect;
+    std::size_t                 longest = 0;
+    for (const auto& [phrase, kind] : phrases)
+    {
+        if (std::strlen(phrase) > longest && said(phrase))
+        {
+            longest = std::strlen(phrase);
+            effect  = kind;
+        }
+    }
+
+    std::vector<SpellID> ladder;
+    for (const auto& song : kAllSongs)
+    {
+        if (effect && song.effect == *effect)
+        {
+            ladder.push_back(song.id);
+        }
+    }
+    return ladder;
+}
+
+auto describeDirectives(const Bot& bot) -> std::string
+{
+    auto*       PChar = bot.entity();
+    const auto& told  = bot.directives;
+
+    const auto whom = [&](const KeepUp& keep) -> std::string
+    {
+        switch (keep.who)
+        {
+            case KeepFor::Self: return "itself";
+            case KeepFor::Member:
+            {
+                const auto* PMember = zoneutils::GetChar(keep.memberId);
+                return PMember != nullptr ? PMember->getName() : std::string("a party member");
+            }
+            case KeepFor::Melee: return "the melee";
+            case KeepFor::Mages: return "the mages";
+            case KeepFor::Everyone: return "everyone";
+            case KeepFor::Monster: return "the monster";
+        }
+        return {};
+    };
+
+    std::vector<std::string> keeping;
+    for (const auto& keep : told.keep)
+    {
+        if (keep.ability != 0)
+        {
+            keeping.push_back(keep.name);
+        }
+        else if (isAvatar(keep))
+        {
+            keeping.push_back(fmt::format("{} out", keep.name));
+        }
+        else
+        {
+            keeping.push_back(fmt::format("{} {} {}", keep.name, songOf(keep.ladder.front()) != nullptr ? "for" : "on", whom(keep)));
+        }
+    }
+    std::vector<std::string> stopped;
+    for (const auto& [flag, name] : kRestraintNames)
+    {
+        if (told.restraints & flag)
+        {
+            stopped.emplace_back(name);
+        }
+    }
+    for (const auto& name : told.avoid)
+    {
+        stopped.push_back(pretty(name));
+    }
+
+    std::string out;
+    if (!keeping.empty())
+    {
+        out += fmt::format(" Keeping up as asked: {}.", fmt::join(keeping, "; "));
+    }
+    if (!stopped.empty())
+    {
+        out += fmt::format(" Told not to use: {}.", fmt::join(stopped, ", "));
+    }
+
+    // A bard's songs as they stand: one set for everyone without Pianissimo, else the melee's and the mages'.
+    if (PChar->GetMJob() == Job::BRD)
+    {
+        const int                held  = songsHeld(PChar);
+        const bool               piano = charutils::hasAbility(PChar, ABILITY_PIANISSIMO);
+        std::vector<const Song*> asked;
+        const auto named = [](const std::vector<const Song*>& songs)
+        {
+            std::vector<std::string> names;
+            for (const auto* song : songs)
+            {
+                names.push_back(fmt::format("{} ({})", pretty(spell::GetSpell(song->id)->getName()), songDoes(song->id)));
+            }
+            return fmt::format("{}", fmt::join(names, " and "));
+        };
+
+        std::vector<std::string> sets;
+        const auto others = partyMembersAll(PChar);
+        for (const bool mage : { false, true })
+        {
+            const auto it = std::ranges::find_if(others, [&](const CBattleEntity* PMember) { return PMember != PChar && isSquishy(PMember->GetMJob()) == mage; });
+            if (it == others.end())
+            {
+                continue;
+            }
+            const auto songs = songsFor(bot, *it, mage, !piano, held, asked);
+            if (!songs.empty())
+            {
+                sets.push_back(piano ? fmt::format("{} for the {}", named(songs), mage ? "mages" : "melee") : named(songs));
+            }
+            if (!piano)
+            {
+                break;
+            }
+        }
+        if (!sets.empty())
+        {
+            out += fmt::format(" Songs kept up: {} ({} on each person at a time).", fmt::join(sets, "; "), held);
+        }
+    }
+    return out;
 }
 
 } // namespace bots

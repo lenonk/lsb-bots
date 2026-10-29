@@ -1,10 +1,12 @@
 //
 // The party brain: the chat model turns a party member's line into bot actions through tool calls.
 //
-//   One request per line, with the party roster and a fixed set of tools. The model may pick a bot
+//   One request per line, with the party's recent chat, the roster (each bot's spells, songs, rolls,
+//   avatars and standing instructions) and a fixed set of tools. keep_up and stop_using set standing
+//   instructions that every job's behaviour follows until told otherwise. The model may pick a bot
 //   that can't do the job or name a spell loosely, so every call is checked here and handed to a bot
-//   that can do it, or answered with why nobody can. The keyword parser in bot_orders.cpp is the
-//   fallback when the model is off or doesn't answer.
+//   that can do it, or answered with why nobody can; what was done goes back as the reply's facts.
+//   The keyword parser in bot_orders.cpp is the fallback when the model is off or doesn't answer.
 //
 
 #include "bots.h"
@@ -594,6 +596,53 @@ auto roster(CCharEntity* PSpeaker, const std::vector<Bot*>& bots) -> std::string
             {
                 out += fmt::format(" Spells: {}.", fmt::join(spells, ", "));
             }
+
+            // Songs, rolls and avatars with what they do, so a request by effect ("accuracy song") finds them.
+            std::vector<std::string> songs;
+            for (const auto* kind : { "march", "minuet", "madrigal", "ballad", "paeon", "minne", "mambo", "prelude" })
+            {
+                const auto ladder = songLadder(kind);
+                if (const auto best = std::ranges::find_if(ladder, [&](const SpellID id) { return spell::CanUseSpell(PChar, id); }); best != ladder.end())
+                {
+                    songs.push_back(fmt::format("{} ({})", spellName(*best), songDoes(*best)));
+                }
+            }
+            if (!songs.empty())
+            {
+                out += fmt::format(" Songs: {}.", fmt::join(songs, ", "));
+            }
+
+            std::vector<std::string> rolls;
+            for (uint16 id = ABILITY_FIGHTERS_ROLL; id <= ABILITY_TACTICIANS_ROLL; ++id)
+            {
+                if (charutils::hasAbility(PChar, id))
+                {
+                    rolls.push_back(fmt::format("{} ({})", prettyName(ability::GetAbility(id)->getName()), rollDoes(id)));
+                }
+            }
+            if (!rolls.empty())
+            {
+                out += fmt::format(" Rolls: {}.", fmt::join(rolls, ", "));
+            }
+
+            std::vector<std::string> avatars;
+            for (const auto id : { SpellID::Carbuncle, SpellID::Fenrir, SpellID::Ifrit, SpellID::Titan, SpellID::Leviathan, SpellID::Garuda, SpellID::Shiva,
+                                   SpellID::Ramuh, SpellID::Diabolos })
+            {
+                if (spell::CanUseSpell(PChar, id))
+                {
+                    avatars.push_back(spellName(id));
+                }
+            }
+            if (!avatars.empty())
+            {
+                out += fmt::format(" Avatars: {}.", fmt::join(avatars, ", "));
+            }
+
+            if (const auto bot = std::ranges::find(bots, PMember->id, &Bot::charId); bot != bots.end())
+            {
+                out += describeDirectives(**bot);
+            }
         }
         out += "\n";
     }
@@ -601,6 +650,10 @@ auto roster(CCharEntity* PSpeaker, const std::vector<Bot*>& bots) -> std::string
     const auto camp   = campSpot(PSpeaker);
     out += fmt::format("Now: {}. {}. Fighting: {}.", PSpeaker->loc.zone ? prettyName(PSpeaker->loc.zone->getName()) : std::string("somewhere"),
                        camp ? "Camp is set" : "No camp set", fightingName(PSpeaker));
+    if (const auto* PTank = mainTank(PSpeaker); PTank != nullptr)
+    {
+        out += fmt::format(" Main tank: {}.", PTank->getName());
+    }
     return out;
 }
 
@@ -617,7 +670,14 @@ constexpr std::string_view kRules =
     "- Saying how they are or what they're doing is not a request: \"brb\", \"afk\", \"out of mp\", \"tired\", \"lol\". When in\n"
     "  doubt, no_action.\n"
     "- FFXI shorthand: voke = Provoke, rr = Raise, sn/inv = Sneak and Invisible, pro/shell = Protect/Shell, para = Paralyze,\n"
-    "  inc = a monster is coming, add/link = an extra monster, >> points at a target, / between jobs is main/sub.\n\n";
+    "  inc = a monster is coming, add/link = an extra monster, >> points at a target, / between jobs is main/sub,\n"
+    "  hold (here) = stay, move out = follow, pulling hate = getting the monster's attention.\n"
+    "- cast is one cast, now. keep_up is from now on (\"keep slow on it\", \"keep haste on me\"): buffs kept on someone,\n"
+    "  enfeebles kept on the monster, a bard's songs (always keep_up), a corsair's rolls, a summoner's avatar. Songs and rolls\n"
+    "  go by what they do.\n"
+    "- stop_using and resume for \"don't nuke\", \"no more sleep\", \"you can ws again\"; reset_instructions for \"back to normal\";\n"
+    "  set_tank when they say who tanks.\n"
+    "- Earlier chat is context; act on the latest line. A correction (\"no, I want X\") replaces what was asked before it.\n\n";
 
 auto tools(const std::vector<std::string>& botNames, const std::vector<std::string>& memberNames) -> std::string
 {
@@ -634,6 +694,12 @@ auto tools(const std::vector<std::string>& botNames, const std::vector<std::stri
     auto       targets = memberNames;
     targets.emplace_back("everyone");
     targets.emplace_back("monster");
+    auto keepTargets = targets;
+    keepTargets.emplace_back("melee");
+    keepTargets.emplace_back("mages");
+    auto everyBot = botNames;
+    everyBot.emplace_back("everyone");
+    const auto anyBot = fmt::format(R"({{"type":"string","enum":[{}]}})", quoted(everyBot));
 
     const auto tool = [](const std::string_view name, const std::string_view description, const std::string& properties, const std::string& required)
     {
@@ -653,6 +719,17 @@ auto tools(const std::vector<std::string>& botNames, const std::vector<std::stri
         tool("party_order", "An instruction for several bots at once.",
              fmt::format(R"("order":{{"type":"string","enum":["attack","stop_attacking","rest","stay","follow","assist"]}},"bots":{{"type":"array","items":{},"description":"empty means everyone"}})", bot),
              R"("order","bots")"),
+        tool("keep_up", "A bot keeps something going from now on: a buff on party members, an enfeeble on the monster, bard songs, corsair rolls, or a summoner's avatar.",
+             fmt::format(R"("bot":{},"what":{{"type":"string","description":"a spell, song, roll or avatar from the roster"}},"target":{{"type":"string","enum":[{}]}})", bot,
+                         quoted(keepTargets)),
+             R"("bot","what","target")"),
+        tool("stop_using", "Bots stop using something until told they can again: nukes, weapon skills, enfeebles, sleep, songs, pets, provoke, ranged attacks, job abilities, two-hours, buffs, or one spell or ability.",
+             fmt::format(R"("bot":{},"what":{{"type":"string"}})", anyBot), R"("bot","what")"),
+        tool("resume", "Bots may use again something they were told to stop using.", fmt::format(R"("bot":{},"what":{{"type":"string"}})", anyBot), R"("bot","what")"),
+        tool("reset_instructions", "Bots drop everything they were told to keep up or stop using and play their own way again.", fmt::format(R"("bot":{})", anyBot),
+             R"("bot")"),
+        tool("set_tank", R"(Only when they say who tanks (\"I'll tank\", \"Aldric, you tank\"): that member is the party's main tank from now on.)",
+             fmt::format(R"("member":{{"type":"string","enum":[{}]}})", quoted(memberNames)), R"("member")"),
     };
     return fmt::format("[{}]", fmt::join(all, ","));
 }
@@ -685,6 +762,211 @@ auto cantCast(CCharEntity* PChar, const SpellID id) -> std::string
                            jobName(PChar->GetMJob()), level, PChar->GetMLevel());
     }
     return fmt::format("You were just asked to cast {}, but you can't right now (not enough MP, or it's still recharging).", name);
+}
+
+auto findAbility(const std::string& name) -> std::optional<uint16>
+{
+    static const auto byName = []
+    {
+        std::map<std::string, uint16> names;
+        for (uint16 id = 1; id < MAX_ABILITY_ID; ++id)
+        {
+            if (auto* PAbility = ability::GetAbility(id))
+            {
+                names.try_emplace(familyName(PAbility->getName()), id);
+            }
+        }
+        return names;
+    }();
+    const auto it = byName.find(familyName(name));
+    return it != byName.end() ? std::optional(it->second) : std::nullopt;
+}
+
+// What the model named: spells best first (a song's lower tiers included), or an ability.
+struct Wanted
+{
+    std::vector<SpellID> ladder;
+    uint16               ability{};
+};
+
+// "Haste", "Cure III", "Chaos Roll", "Garuda", "Sword Madrigal (accuracy)", "madrigal" or "accuracy song".
+auto resolve(std::string said) -> std::optional<Wanted>
+{
+    said = said.substr(0, said.find('('));
+    while (!said.empty() && std::isspace(static_cast<unsigned char>(said.back())))
+    {
+        said.pop_back();
+    }
+    if (said.empty())
+    {
+        return std::nullopt;
+    }
+
+    if (const auto spell = findSpell(said))
+    {
+        // A song by name: it and the weaker ones of its kind, in case the bard hasn't learnt it yet.
+        if (songDoes(*spell) != nullptr)
+        {
+            auto ladder = songLadder(spellName(*spell));
+            ladder.erase(ladder.begin(), std::ranges::find(ladder, *spell));
+            return Wanted{ .ladder = ladder };
+        }
+        return Wanted{ .ladder = ladderOf(*spell) };
+    }
+    if (const auto ability = findAbility(said))
+    {
+        return Wanted{ .ability = *ability };
+    }
+    if (auto ladder = songLadder(said); !ladder.empty())
+    {
+        return Wanted{ .ladder = ladder };
+    }
+    return std::nullopt;
+}
+
+auto canDo(CCharEntity* PChar, const Wanted& wanted) -> bool
+{
+    return wanted.ability != 0 ? charutils::hasAbility(PChar, wanted.ability) : canCast(PChar, wanted.ladder);
+}
+
+// The name to say: the tier this bot will actually use.
+auto nameFor(CCharEntity* PChar, const Wanted& wanted) -> std::string
+{
+    if (wanted.ability != 0)
+    {
+        return prettyName(ability::GetAbility(wanted.ability)->getName());
+    }
+    const auto known = std::ranges::find_if(wanted.ladder, [&](const SpellID id) { return spell::CanUseSpell(PChar, id); });
+    return spellName(known != wanted.ladder.end() ? *known : wanted.ladder.front());
+}
+
+// Whom a standing instruction covers: rolls everyone, avatars the summoner, enfeebles the monster, songs the asker's side
+// (melee or mages) unless a side or everyone was named, self-only spells the caster, other buffs whoever was named.
+auto keepFor(const Wanted& wanted, const std::string& target, CCharEntity* PSpeaker) -> std::pair<KeepFor, uint32>
+{
+    const auto* PSpell = wanted.ladder.empty() ? nullptr : spell::GetSpell(wanted.ladder.front());
+    const auto  named  = lowered(target);
+    if (PSpell == nullptr)
+    {
+        return { KeepFor::Everyone, 0 };
+    }
+    if (PSpell->getSpellGroup() == SPELLGROUP_SUMMONING)
+    {
+        return { KeepFor::Self, 0 };
+    }
+    if (PSpell->getValidTarget() & TARGET_ENEMY)
+    {
+        return { KeepFor::Monster, 0 };
+    }
+
+    CBattleEntity* PMember = PSpeaker;
+    for (auto* POther : PSpeaker->PParty->members)
+    {
+        if (lowered(POther->getName()) == named)
+        {
+            PMember = POther;
+        }
+    }
+    if (named == "melee" || named == "mages" || named == "everyone")
+    {
+        return { named == "melee" ? KeepFor::Melee : named == "mages" ? KeepFor::Mages : KeepFor::Everyone, 0 };
+    }
+    if (songDoes(wanted.ladder.front()) != nullptr)
+    {
+        const auto job = PMember->GetMJob();
+        const bool mage = job == Job::WHM || job == Job::BLM || job == Job::RDM || job == Job::BRD || job == Job::SMN || job == Job::SCH || job == Job::GEO;
+        return { mage ? KeepFor::Mages : KeepFor::Melee, 0 };
+    }
+    if ((PSpell->getValidTarget() & (TARGET_PLAYER_PARTY | TARGET_PLAYER_PARTY_PIANISSIMO)) == 0)
+    {
+        return { KeepFor::Self, 0 };
+    }
+    return { KeepFor::Member, PMember->id };
+}
+
+auto whomText(const KeepFor who, const uint32 memberId, const Bot& bot) -> std::string
+{
+    switch (who)
+    {
+        case KeepFor::Self: return "yourself";
+        case KeepFor::Member:
+        {
+            if (memberId == bot.charId)
+            {
+                return "yourself";
+            }
+            const auto* PMember = zoneutils::GetChar(memberId);
+            return PMember != nullptr ? PMember->getName() : std::string("them");
+        }
+        case KeepFor::Melee: return "the melee";
+        case KeepFor::Mages: return "the mages";
+        case KeepFor::Everyone: return "everyone";
+        case KeepFor::Monster: return "the monster";
+    }
+    return {};
+}
+
+// Same thing to keep: one song kind, one spell family, one ability.
+auto sameKind(const KeepUp& keep, const Wanted& wanted) -> bool
+{
+    if (keep.ability != 0 || wanted.ability != 0)
+    {
+        return keep.ability == wanted.ability;
+    }
+    const auto kind = [](const SpellID id) { return songDoes(id) != nullptr ? spellName(songLadder(spellName(id)).front()) : familyName(spellName(id)); };
+    return !keep.ladder.empty() && !wanted.ladder.empty() && kind(keep.ladder.front()) == kind(wanted.ladder.front());
+}
+
+// Sets the instruction on the bot and says what it now does, in facts the model can repeat.
+auto keepUp(Bot& bot, const Wanted& wanted, const KeepFor who, const uint32 memberId) -> std::string
+{
+    auto*      PChar = bot.entity();
+    auto&      told  = directivesOf(bot);
+    const auto name  = nameFor(PChar, wanted);
+
+    std::erase_if(told.keep, [&](const KeepUp& keep) { return sameKind(keep, wanted) && keep.who == who && keep.memberId == memberId; });
+    told.keep.insert(told.keep.begin(), KeepUp{ .ladder = wanted.ladder, .ability = wanted.ability, .who = who, .memberId = memberId, .name = name });
+
+    // A bard holds only so many songs on each person: the oldest request for the same people goes.
+    const bool song = !wanted.ladder.empty() && songDoes(wanted.ladder.front()) != nullptr;
+    if (song)
+    {
+        int asked = 0;
+        std::erase_if(told.keep,
+                      [&](const KeepUp& keep)
+                      {
+                          const bool same = !keep.ladder.empty() && songDoes(keep.ladder.front()) != nullptr && keep.who == who && keep.memberId == memberId;
+                          return same && ++asked > songsHeldBy(PChar);
+                      });
+        if (told.restraints & kNoSongs)
+        {
+            told.restraints &= ~kNoSongs;
+        }
+    }
+
+    std::string note;
+    if (!wanted.ladder.empty() && spellName(wanted.ladder.front()) != name)
+    {
+        note = fmt::format("You don't have {} yet, so it's {}. ", spellName(wanted.ladder.front()), name);
+    }
+    if (wanted.ability != 0)
+    {
+        note += fmt::format("You were just asked to keep up {} ({}) and from now on you do.", name, rollDoes(wanted.ability) ? rollDoes(wanted.ability) : "as asked");
+    }
+    else if (song)
+    {
+        note += fmt::format("You were just asked to sing {} ({}) for {} and from now on you keep it going.", name, songDoes(wanted.ladder.front()),
+                            whomText(who, memberId, bot));
+    }
+    else if (who == KeepFor::Self && spell::GetSpell(wanted.ladder.front())->getSpellGroup() == SPELLGROUP_SUMMONING)
+    {
+        note += fmt::format("You were just asked to keep {} out and from now on you do, between fights too.", name);
+    }
+    else
+    {
+        note += fmt::format("You were just asked to keep {} on {} and from now on you do.", name, whomText(who, memberId, bot));
+    }
+    return note + describeDirectives(bot);
 }
 
 // Turns the model's calls into checked orders for bots in the party.
@@ -792,17 +1074,73 @@ auto plansFor(const std::vector<ToolCall>& calls, const std::string& text, CChar
                 plans[i].order->subject = PSubject != nullptr ? PSubject->id : 0;
             }
         }
-        else if (call.name == "cast")
+        else if (call.name == "cast" || call.name == "keep_up")
         {
-            const auto spell = findSpell(arg("spell"));
-            if (!spell)
+            // What was named: unknown gets an honest answer instead of a made-up one.
+            const auto said   = arg(call.name == "cast" ? "spell" : "what");
+            const auto wanted = resolve(said);
+            auto*      named  = findBot(bots, arg("bot"));
+            if (!wanted)
             {
-                ShowInfoFmt("bots: the party brain named an unknown spell: {}", arg("spell"));
+                ShowInfoFmt("bots: the party brain named something unknown: {}", said);
+                if (auto* answer = named != nullptr ? named : bots.empty() ? nullptr : bots.front())
+                {
+                    plans.push_back(OrderPlan{ .bot = answer,
+                                               .note = fmt::format("You were just asked for \"{}\", which isn't a spell, song or ability you know. Say you're not sure "
+                                                                   "what they mean, and don't claim to be doing anything.",
+                                                                   said) });
+                }
                 continue;
             }
-            const auto ladder    = ladderOf(*spell);
-            const auto target    = lowered(arg("target"));
-            const bool onMonster = target == "monster";
+
+            const auto* PFirst    = wanted->ladder.empty() ? nullptr : spell::GetSpell(wanted->ladder.front());
+            const auto  target    = lowered(arg("target"));
+            const bool  onMonster = target == "monster" || (PFirst != nullptr && (PFirst->getValidTarget() & TARGET_ENEMY));
+
+            // The named bot if it can, else the best one that can, else the reason nobody can.
+            auto* bot = named;
+            if (bot == nullptr || !canDo(bot->entity(), *wanted))
+            {
+                std::vector<Bot*> able;
+                std::ranges::copy_if(bots, std::back_inserter(able), [&](Bot* other) { return canDo(other->entity(), *wanted); });
+                std::ranges::stable_sort(able, [&](Bot* a, Bot* b) {
+                    return castPreference(a->entity()->GetMJob(), onMonster) < castPreference(b->entity()->GetMJob(), onMonster);
+                });
+                if (able.empty())
+                {
+                    auto* answer = bot != nullptr ? bot : bots.empty() ? nullptr : bots.front();
+                    if (answer != nullptr)
+                    {
+                        plans.push_back(OrderPlan{ .bot = answer,
+                                                   .note = wanted->ability != 0
+                                                               ? fmt::format("You were just asked to use {}, but nobody in the party can.", nameFor(answer->entity(), *wanted))
+                                                               : cantCast(answer->entity(), wanted->ladder.front()) });
+                    }
+                    continue;
+                }
+                bot = able.front();
+            }
+
+            // Any other ability is used once: Barrage, Release, Benediction.
+            if (wanted->ability != 0 && rollDoes(wanted->ability) == nullptr)
+            {
+                auto use    = order(OrderKind::Ability);
+                use.ability = wanted->ability;
+                plans.push_back(OrderPlan{ .bot = bot, .order = use, .note = doing(fmt::format("use {}", nameFor(bot->entity(), *wanted))) });
+                continue;
+            }
+
+            // Songs, rolls and avatars are always kept up; anything else is when asked to and its effect can be watched.
+            const bool always = wanted->ability != 0 || (PFirst != nullptr && (songDoes(wanted->ladder.front()) != nullptr || PFirst->getSpellGroup() == SPELLGROUP_SUMMONING));
+            if (always || (call.name == "keep_up" && canKeepUp(wanted->ladder.front())))
+            {
+                const auto [who, memberId] = keepFor(*wanted, arg("target"), PSpeaker);
+                plans.push_back(OrderPlan{ .bot = bot, .note = keepUp(*bot, *wanted, who, memberId) });
+                continue;
+            }
+
+            const auto& ladder = wanted->ladder;
+            const auto  spell  = std::optional(ladder.front());
 
             std::vector<uint32> targets;
             if (target == "everyone")
@@ -818,31 +1156,117 @@ auto plansFor(const std::vector<ToolCall>& calls, const std::string& text, CChar
                 targets.push_back(member != PSpeaker->PParty->members.end() ? (*member)->id : PSpeaker->id);
             }
 
-            // The named bot if it can, else the best one that can, else the reason nobody can.
-            auto* bot = findBot(bots, arg("bot"));
-            if (bot == nullptr || !canCast(bot->entity(), ladder))
-            {
-                std::vector<Bot*> able;
-                std::ranges::copy_if(bots, std::back_inserter(able), [&](Bot* other) { return canCast(other->entity(), ladder); });
-                std::ranges::stable_sort(able, [&](Bot* a, Bot* b) {
-                    return castPreference(a->entity()->GetMJob(), onMonster) < castPreference(b->entity()->GetMJob(), onMonster);
-                });
-                if (able.empty())
-                {
-                    auto* answer = bot != nullptr ? bot : bots.empty() ? nullptr : bots.front();
-                    if (answer != nullptr)
-                    {
-                        plans.push_back(OrderPlan{ .bot = answer, .order = std::nullopt, .note = cantCast(answer->entity(), *spell) });
-                    }
-                    continue;
-                }
-                bot = able.front();
-            }
-
             auto cast    = order(OrderKind::Cast);
             cast.spells  = ladder;
             cast.targets = targets;
-            plans.push_back(OrderPlan{ .bot = bot, .order = cast, .note = doing(fmt::format("cast {}{}", spellName(*spell), onMonster ? " on the monster" : "")) });
+            plans.push_back(OrderPlan{ .bot = bot, .order = cast,
+                                       .note = doing(fmt::format("cast {}{}", spellName(*spell), onMonster ? " on the monster" : "")) +
+                                               (call.name == "keep_up" ? " It's a single cast: you can't tell when it wears off, so they'll need to ask again." : "") });
+        }
+        else if (call.name == "stop_using" || call.name == "resume")
+        {
+            const bool stop   = call.name == "stop_using";
+            const auto what   = arg("what");
+            const auto flag   = restraintFor(what);
+            const auto wanted = flag == 0 ? resolve(what) : std::nullopt;
+
+            std::vector<Bot*> who = bots;
+            if (auto* one = findBot(bots, arg("bot")); one != nullptr)
+            {
+                who = { one };
+            }
+            if (who.empty())
+            {
+                continue;
+            }
+            if (flag == 0 && !wanted)
+            {
+                plans.push_back(OrderPlan{ .bot = who.front(),
+                                           .note = fmt::format("You were just told about \"{}\", which isn't something you use. Say you're not sure what they mean.", what) });
+                continue;
+            }
+
+            const auto family = !wanted ? std::string{} : wanted->ability != 0 ? familyName(ability::GetAbility(wanted->ability)->getName())
+                                                                               : familyName(spellName(wanted->ladder.front()));
+            const auto label  = !wanted ? what : nameFor(who.front()->entity(), *wanted);
+
+            // What a category covers among the things kept up, so "no songs" also drops the songs asked for.
+            const auto inCategory = [&](const KeepUp& keep)
+            {
+                const auto* PSpell = keep.ladder.empty() ? nullptr : spell::GetSpell(keep.ladder.front());
+                const bool  song   = PSpell != nullptr && songDoes(keep.ladder.front()) != nullptr;
+                const bool  avatar = PSpell != nullptr && PSpell->getSpellGroup() == SPELLGROUP_SUMMONING;
+                return ((flag & kNoSongs) && song) || ((flag & (kNoEnfeebles | kNoSleeps)) && keep.who == KeepFor::Monster) || ((flag & kNoPets) && avatar) ||
+                       ((flag & kNoBuffs) && !song && !avatar && keep.who != KeepFor::Monster);
+            };
+
+            for (std::size_t i = 0; i < who.size(); ++i)
+            {
+                auto& told = directivesOf(*who[i]);
+                if (flag != 0)
+                {
+                    told.restraints = stop ? (told.restraints | flag) : (told.restraints & ~flag);
+                    if (stop)
+                    {
+                        std::erase_if(told.keep, inCategory);
+                    }
+                }
+                else if (stop)
+                {
+                    if (!std::ranges::contains(told.avoid, family))
+                    {
+                        told.avoid.push_back(family);
+                    }
+                    std::erase_if(told.keep, [&](const KeepUp& keep) { return sameKind(keep, *wanted); });
+                }
+                else
+                {
+                    std::erase(told.avoid, family);
+                }
+                plans.push_back(OrderPlan{ .bot   = who[i],
+                                           .note  = stop ? fmt::format("You were just told to stop using {}; from now on you don't, until told you can again.", label)
+                                                         : fmt::format("You were just told you can use {} again.", label),
+                                           .quiet = i > 0 });
+            }
+        }
+        else if (call.name == "reset_instructions")
+        {
+            std::vector<Bot*> who = bots;
+            if (auto* one = findBot(bots, arg("bot")); one != nullptr)
+            {
+                who = { one };
+            }
+            for (std::size_t i = 0; i < who.size(); ++i)
+            {
+                auto& told = directivesOf(*who[i]);
+                told       = Directives{ .partyId = told.partyId };
+                plans.push_back(OrderPlan{ .bot   = who[i],
+                                           .note  = "You were just told to go back to your own judgment: everything you were asked to keep up or stop doing is dropped.",
+                                           .quiet = i > 0 });
+            }
+        }
+        else if (call.name == "set_tank" && !bots.empty())
+        {
+            CBattleEntity* PTank = PSpeaker;
+            for (auto* PMember : PSpeaker->PParty->members)
+            {
+                if (lowered(PMember->getName()) == lowered(arg("member")))
+                {
+                    PTank = PMember;
+                }
+            }
+            // Already the tank: most likely a question ("who's tanking?"), so it's only answered.
+            if (const auto* PNow = mainTank(PSpeaker); PNow == PTank)
+            {
+                plans.push_back(OrderPlan{ .bot = bots.front(), .note = fmt::format("{} is the party's main tank.", PTank->getName()) });
+                continue;
+            }
+            setMainTank(PSpeaker->PParty->GetPartyID(), PTank->id);
+
+            const auto tanker = std::ranges::find(bots, PTank->id, &Bot::charId);
+            plans.push_back(tanker != bots.end()
+                                ? OrderPlan{ .bot = *tanker, .note = "You were just made the party's main tank: you hold hate, and the others leave it to you." }
+                                : OrderPlan{ .bot = bots.front(), .note = fmt::format("{} is the party's main tank now; the bots leave hate to them.", PTank->getName()) });
         }
     }
     return plans;
@@ -879,9 +1303,22 @@ auto askBrain(const std::string& text, CCharEntity* PSpeaker, const std::vector<
         model = fmt::format(R"("model":"{}",)", escape(name));
     }
 
+    // The party's last few lines before this one, so a follow-up or a correction reads in context.
+    auto       earlier = partyChat(PSpeaker->PParty->GetPartyID());
+    const auto line    = fmt::format("{}: {}", PSpeaker->getName(), text);
+    if (!earlier.empty() && earlier.back() == line)
+    {
+        earlier.pop_back();
+    }
+    if (earlier.size() > 8)
+    {
+        earlier.erase(earlier.begin(), earlier.end() - 8);
+    }
+    const auto said = earlier.empty() ? line : fmt::format("Earlier party chat, for context:\n{}\n\nThe line to act on:\n{}", fmt::join(earlier, "\n"), line);
+
     const auto system = fmt::format("{}{}", kRules, roster(PSpeaker, bots));
-    const auto body   = fmt::format(R"({{{}"messages":[{{"role":"system","content":"{}"}},{{"role":"user","content":"{}: {}"}}],"tools":{},"tool_choice":"required","max_tokens":200,"temperature":0}})",
-                                    model, escape(system), escape(PSpeaker->getName()), escape(text), tools(botNames, memberNames));
+    const auto body   = fmt::format(R"({{{}"messages":[{{"role":"system","content":"{}"}},{{"role":"user","content":"{}"}}],"tools":{},"tool_choice":"required","max_tokens":300,"temperature":0}})",
+                                    model, escape(system), escape(said), tools(botNames, memberNames));
 
     const auto id = nextId++;
     contexts[id]  = Context{ text, PSpeaker->getName(), botIds };

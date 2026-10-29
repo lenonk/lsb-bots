@@ -98,6 +98,24 @@ constexpr auto kConversationWindow = std::chrono::seconds(90);
 constexpr int  kMaxBotRun          = 3;
 constexpr auto kQuietTime          = std::chrono::minutes(20);
 
+// Main thread only: party chat by party, players and bots alike, so the brain reads a line in context.
+std::map<uint32, std::deque<std::string>> partyLines;
+constexpr std::size_t                     kPartyLines = 12;
+
+void notePartyLine(const CCharEntity* PSpeaker, const std::string& text)
+{
+    if (PSpeaker == nullptr || PSpeaker->PParty == nullptr)
+    {
+        return;
+    }
+    auto& lines = partyLines[PSpeaker->PParty->GetPartyID()];
+    lines.push_back(fmt::format("{}: {}", PSpeaker->getName(), text));
+    while (lines.size() > kPartyLines)
+    {
+        lines.pop_front();
+    }
+}
+
 auto isTell(const uint8 kind) -> bool
 {
     return kind == MESSAGE_TELL;
@@ -701,6 +719,12 @@ auto describe(const Bot& bot, const bool places = false) -> std::string
                                  PVictim ? fmt::format(", attacking {}", PVictim == PChar ? std::string("you") : PVictim->getName()) : std::string());
     }
 
+    // What the party told it, and a bard's songs, so it answers about them truthfully.
+    if (const auto told = describeDirectives(bot); !told.empty())
+    {
+        situation += fmt::format("\n- Your orders and songs:{}", told);
+    }
+
     auto& camps = campsByLevel[PChar->GetMLevel()];
     if (camps.empty())
     {
@@ -852,6 +876,10 @@ void say(Bot& bot, PacketSystem& packets, const Reply& reply)
         chat->Kind   = static_cast<uint8_t>(replyKind(reply.kind));
         std::memcpy(chat->Str, reply.text.data(), std::min(reply.text.size(), sizeof(chat->Str) - 1));
         send(bot, packets, *packet);
+        if (isParty(reply.kind))
+        {
+            notePartyLine(bot.entity(), reply.text);
+        }
     }
 
     remember(bot.charId, fmt::format("{}{}", kOwnPrefix, reply.text));
@@ -877,6 +905,12 @@ void startChat()
     {
         std::thread(worker).detach();
     }
+}
+
+auto partyChat(const uint32 partyId) -> std::vector<std::string>
+{
+    const auto it = partyLines.find(partyId);
+    return it != partyLines.end() ? std::vector<std::string>(it->second.begin(), it->second.end()) : std::vector<std::string>{};
 }
 
 // Picks who answers what, across all bots, from what each heard this tick.
@@ -959,6 +993,10 @@ void handleChat(std::vector<Bot>& online, const std::set<std::string>& botNames)
         const auto  kind    = listeners.front().heard.kind;
         const auto& from    = listeners.front().heard.from;
         auto*       PSender = zoneutils::GetCharByName(from);
+        if (isParty(kind) && !botNames.contains(from))
+        {
+            notePartyLine(PSender, listeners.front().heard.text);
+        }
 
         // Bots answer each other too, but only now and then, one at a time, and a run of bot-only lines ends
         // after a few; a real player speaking starts the count over.

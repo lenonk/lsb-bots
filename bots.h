@@ -79,6 +79,7 @@ enum class OrderKind : uint8
     StopPull, // nobody pulls
     Camp,     // camp is where the leader stands now
     Assist,   // fight whatever the subject fights, from now on
+    Ability,  // a job ability once: on the speaker's monster or on itself
 };
 
 struct Order
@@ -89,12 +90,59 @@ struct Order
     uint32               speakerId{};
     uint32               subject{}; // Follow and Assist: whom; 0 for the speaker
     timer::time_point    expires{};
+    uint16               ability{};
 };
 
 struct PlayerZone
 {
     uint8      level{}; // highest real player level in the zone
     position_t pos{};   // where that player is
+};
+
+// Whom a standing instruction is for.
+enum class KeepFor : uint8
+{
+    Self,
+    Member, // memberId
+    Melee,
+    Mages,
+    Everyone,
+    Monster, // whatever the party is fighting
+};
+
+// "Keep Haste on me", "keep Slow on it", "Madrigal for the melee", "use Chaos Roll", "keep Garuda out", until told otherwise.
+struct KeepUp
+{
+    std::vector<SpellID> ladder;    // the spell asked for, then its lower tiers; empty for an ability
+    uint16               ability{}; // a job ability instead: a Corsair roll
+    KeepFor              who{};
+    uint32               memberId{};
+    std::string          name; // as the party says it, for the roster and replies
+};
+
+// What a bot was told to stop doing, until told it can again.
+enum Restraint : uint16
+{
+    kNoNukes        = 1 << 0,
+    kNoWeaponSkills = 1 << 1,
+    kNoEnfeebles    = 1 << 2,
+    kNoSleeps       = 1 << 3,
+    kNoSongs        = 1 << 4,
+    kNoPets         = 1 << 5,
+    kNoProvoke      = 1 << 6,
+    kNoRanged       = 1 << 7,
+    kNoAbilities    = 1 << 8,
+    kNoTwoHours     = 1 << 9,
+    kNoBuffs        = 1 << 10,
+};
+
+// Standing instructions from the party, through the brain. A bot in a new party starts without any.
+struct Directives
+{
+    uint32                   partyId{};
+    std::vector<KeepUp>      keep; // newest first
+    uint16                   restraints{};
+    std::vector<std::string> avoid; // spells and abilities by family: "dia", "provoke", "chaos_roll"
 };
 
 // A nuke a bot cast, kept until its next turn to see how much enmity it really added.
@@ -151,6 +199,11 @@ struct Bot
     std::map<uint64, timer::time_point> attempts; // per action and target, the earliest retry
     std::optional<NukeWatch>    nukeWatch;       // the last nuke, until the enmity it added is known
     std::deque<float>           nukeRatios;      // enmity added over estimated, for the last few nukes
+    SpellID                     songWalk{};      // the song a bard is walking over to sing, and since when
+    timer::time_point           songWalkSince{};
+    timer::time_point           songWalkUntil{}; // while walking to sing, it isn't held at casting distance
+    Directives                  directives;      // what the party told it to keep doing or stop doing
+    bool                        directed{};      // carrying out one of them: what it was told to stop doesn't apply
 
     auto entity() const -> CCharEntity*;
 };
@@ -218,6 +271,17 @@ auto speedUp(Bot& bot, PacketSystem& packets, timer::time_point tick) -> bool;
 auto asleep(const CBattleEntity* PEntity) -> bool;
 auto addNeedsSleep(CCharEntity* PChar, CBattleEntity* PTarget) -> bool;
 auto conceal(Bot& bot, PacketSystem& packets, const CCharEntity* PGuide, timer::time_point tick) -> bool;
+auto familyName(const std::string& name) -> std::string; // "Cure III" or "cure_iii" -> "cure"
+auto canKeepUp(SpellID id) -> bool;                       // its effect can be seen, so it can be kept on someone
+auto songDoes(SpellID id) -> const char*;                 // "accuracy" for a Madrigal; null for anything but a party song
+auto rollDoes(uint16 abilityId) -> const char*;           // "attack" for Chaos Roll; null for anything but a roll
+auto songsHeldBy(CCharEntity* PChar) -> int;
+auto directivesOf(Bot& bot) -> Directives&;               // its instructions, cleared when its party has changed
+auto describeDirectives(const Bot& bot) -> std::string;   // for the brain's roster and the bot's own chat
+auto restraintFor(const std::string& word) -> uint16;   // the flag for "nukes", "weapon skills" and so on; 0 for anything else
+auto songLadder(const std::string& words) -> std::vector<SpellID>; // "madrigal" or "accuracy song": that song's tiers, best first
+void setMainTank(uint32 partyId, uint32 memberId);
+auto chosenTank(uint32 partyId) -> uint32;
 
 // bot_pull.cpp
 void setPuller(CBattleEntity* PLeader, uint32 pullerId);
@@ -287,6 +351,7 @@ void deliverChat(std::vector<Bot>& online, PacketSystem& packets);
 void callout(const Bot& bot, const std::string& text, bool macro);
 void tell(const Bot& bot, const std::string& to, const std::string& text);
 void greet(const Bot& bot);
+auto partyChat(uint32 partyId) -> std::vector<std::string>; // the party's recent lines, "Name: text", oldest first
 
 // bot_linkshell.cpp
 void ensureLinkshell();

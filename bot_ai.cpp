@@ -257,18 +257,56 @@ auto combatTarget(Bot& bot, CCharEntity* PChar, CCharEntity* PLeader) -> CBattle
     return PNearest;
 }
 
+auto navMeshOf(const CCharEntity* PChar) -> NavMesh*
+{
+    return PChar->loc.zone != nullptr ? PChar->loc.zone->navMesh() : nullptr;
+}
+
+// A path to pos, or else to the nearest point on the navmesh to it: a spot worked out from angles can be inside a wall.
+auto pathNear(CCharEntity* PChar, const position_t& pos, const float within) -> bool
+{
+    auto&      path  = *PChar->PAI->PathFind;
+    const auto start = [&](const position_t& to) { return within > 0.0f ? path.PathAround(to, within, PATHFLAG_RUN) : path.PathTo(to, PATHFLAG_RUN); };
+    if (start(pos))
+    {
+        return true;
+    }
+    const auto* mesh = navMeshOf(PChar);
+    const auto  near = mesh != nullptr ? mesh->findClosestValidPoint(pos) : std::nullopt;
+    return near && distance(*near, pos) > 0.5f && start(*near);
+}
+
+// No path found: a bot on the navmesh steps along its surface, which stops at walls and ledges; one off it (in a wall,
+// up a cliff) goes back onto it. Only a zone without a navmesh is walked in a straight line.
+void stepSafely(CCharEntity* PChar, const position_t& pos)
+{
+    auto&       path = *PChar->PAI->PathFind;
+    const auto* mesh = navMeshOf(PChar);
+    if (position_t reached{}; mesh != nullptr && mesh->moveAlongSurface(PChar->loc.p, pos, reached))
+    {
+        if (distance(reached, PChar->loc.p) > 0.1f)
+        {
+            path.StepTo(reached, true);
+        }
+        return;
+    }
+    if (const auto back = mesh != nullptr ? mesh->findClosestValidPoint(PChar->loc.p) : std::nullopt)
+    {
+        path.WarpTo(*back, 0.0f);
+        return;
+    }
+    path.StepTo(pos, true);
+}
+
 void moveToward(CCharEntity* PChar, const position_t& pos, const float within, const timer::time_point tick)
 {
     auto& path = *PChar->PAI->PathFind;
 
     if (distance(PChar->loc.p, pos) > within)
     {
-        if (!path.IsFollowingPath() || distance(path.GetDestination(), pos) > within)
+        if ((!path.IsFollowingPath() || distance(path.GetDestination(), pos) > within) && !pathNear(PChar, pos, within * 0.75f))
         {
-            if (!path.PathAround(pos, within * 0.75f, PATHFLAG_RUN))
-            {
-                path.StepTo(pos, true);
-            }
+            stepSafely(PChar, pos);
         }
     }
     else if (path.IsFollowingPath())
@@ -289,9 +327,9 @@ void moveToSpot(CCharEntity* PChar, const position_t& spot, const timer::time_po
 
     if (distance(PChar->loc.p, spot) > 0.8f)
     {
-        if ((!path.IsFollowingPath() || distance(path.GetDestination(), spot) > 1.0f) && !path.PathTo(spot, PATHFLAG_RUN))
+        if ((!path.IsFollowingPath() || distance(path.GetDestination(), spot) > 1.0f) && !pathNear(PChar, spot, 0.0f))
         {
-            path.StepTo(spot, true);
+            stepSafely(PChar, spot);
         }
     }
     else if (path.IsFollowingPath())
@@ -320,7 +358,13 @@ void follow(CCharEntity* PChar, CCharEntity* PLeader, const timer::time_point ti
 
     if (distance(PChar->loc.p, PLeader->loc.p) > kRegroupDistance)
     {
+        // Behind the leader, on the navmesh: the spot behind them can be inside a wall.
         PChar->PAI->PathFind->WarpTo(PLeader->loc.p, kFollowDistance);
+        const auto* mesh = navMeshOf(PChar);
+        if (const auto onMesh = mesh != nullptr ? mesh->findClosestValidPoint(PChar->loc.p) : std::nullopt; onMesh && distance(*onMesh, PChar->loc.p) > 1.0f)
+        {
+            PChar->PAI->PathFind->WarpTo(*onMesh, 0.0f);
+        }
         return;
     }
 
@@ -622,8 +666,29 @@ void fight(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CBattleEntity* P
 }
 
 // Casters and archers fan out behind the target at range; one that has hate holds its ground and takes it.
+// Holds its ground while the distance still works: re-placing each time the monster turns kept archers and casters
+// running, and a shot or cast started on the move is interrupted.
 void keepRange(CCharEntity* PChar, CBattleEntity* PTarget, const float range, const timer::time_point tick)
 {
+    auto&      path   = *PChar->PAI->PathFind;
+    const auto inBand = [&](const position_t& at)
+    {
+        const float gap = distance(at, PTarget->loc.p);
+        return gap >= range * 0.6f && gap <= range + 3.0f;
+    };
+    if (path.IsFollowingPath() ? inBand(path.GetDestination()) : inBand(PChar->loc.p))
+    {
+        if (path.IsFollowingPath())
+        {
+            path.FollowPath(tick);
+        }
+        else
+        {
+            path.LookAt(PTarget->loc.p);
+        }
+        return;
+    }
+
     if (const auto spot = combatSpot(PChar, PTarget, range))
     {
         moveToSpot(PChar, *spot, tick);
@@ -1198,7 +1263,10 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
             {
                 sendAction(bot, packets, GP_CLI_COMMAND_ACTION_ACTIONID::AttackOff, PChar);
             }
-            keepRange(PChar, PTarget, isRanged(PChar) ? kArcherDistance : kCasterDistance, tick);
+            if (tick >= bot.songWalkUntil)
+            {
+                keepRange(PChar, PTarget, isRanged(PChar) ? kArcherDistance : kCasterDistance, tick);
+            }
         }
         else
         {
