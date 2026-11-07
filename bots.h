@@ -25,6 +25,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 class CBaseEntity;
@@ -229,6 +230,23 @@ inline auto lowerCase(std::string text) -> std::string
     return text;
 }
 
+// Any of the phrases as whole words in lower-case text: "pull" in "pull bats", not in "pulled".
+inline auto saysPhrase(const std::string& text, const std::initializer_list<std::string_view> phrases) -> bool
+{
+    for (const auto phrase : phrases)
+    {
+        for (auto at = text.find(phrase); at != std::string::npos; at = text.find(phrase, at + 1))
+        {
+            const auto end = at + phrase.size();
+            if ((at == 0 || !std::isalpha(static_cast<unsigned char>(text[at - 1]))) && (end >= text.size() || !std::isalpha(static_cast<unsigned char>(text[end]))))
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 // bot_pool.cpp
 void ensureSchema();
 auto loadPool() -> std::vector<PoolEntry>;
@@ -254,12 +272,16 @@ void walkTo(CCharEntity* PChar, const position_t& pos, float within, timer::time
 // bot_combat.cpp
 auto throttle(Bot& bot, uint32 key, uint32 targetId, timer::duration cooldown, timer::time_point tick) -> bool;
 auto isCaster(xi::Job job) -> bool;
-auto isRanged(CCharEntity* PChar) -> bool;
+auto isRanged(CCharEntity* PChar) -> bool;  // a ranger or corsair that fights with its ranged weapon
+auto canShoot(CCharEntity* PChar) -> bool;  // any job with something to fire, enough to pull with
 auto mainTank(CCharEntity* PChar) -> CBattleEntity*;
 auto pulledHate(CCharEntity* PChar, CBattleEntity* PTarget) -> bool;
 auto chasedOffTank(CCharEntity* PChar) -> bool;
 auto healingWanted(CCharEntity* PChar) -> bool;
 auto partyHealer(CCharEntity* PChar) -> CBattleEntity*;
+auto signetWorks(const CBattleEntity* PEntity) -> bool; // resting heals more and costs no TP here
+void askForCure(Bot& bot, timer::time_point tick);      // the party's healer answers it first
+auto askedForCure(uint32 charId, timer::time_point tick) -> bool;
 auto hateStatus(CCharEntity* PChar, CBattleEntity* PTarget) -> std::string;
 auto deadToRaise(CCharEntity* PChar) -> CCharEntity*;
 auto raiserNearby(CCharEntity* PChar) -> bool;
@@ -292,6 +314,13 @@ auto campSpot(const CCharEntity* PChar) -> std::optional<position_t>;
 auto beingPulled(const CCharEntity* PChar, const CBattleEntity* PMob) -> bool;
 auto pull(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CCharEntity* PLeader, timer::time_point tick) -> bool;
 auto pullStatus(const CCharEntity* PChar) -> std::string;
+auto pullChoice(const std::string& text, CCharEntity* PSpeaker) -> std::optional<std::string>; // the note to answer with, when the line says what to pull
+auto pullChoiceText(const CCharEntity* PChar) -> std::string; // "Pulling only Siege Bat." or ""
+auto recallPuller(const std::string& text, CCharEntity* PSpeaker) -> std::optional<std::string>; // "come back": the puller's note
+auto pullAnyway(const std::string& text, CCharEntity* PSpeaker) -> std::optional<std::string>;   // the leader's "pull anyway": the puller's note
+auto pullOutlook(CCharEntity* PPuller) -> std::string; // why there's nothing to pull, or ""
+auto pullReport(CCharEntity* PPuller) -> std::string;  // what the puller is doing, for its answer
+auto pullerOf(const CCharEntity* PChar) -> uint32;             // 0 when nobody pulls
 auto autoCamp(CCharEntity* PLeader, bool withPlayer) -> bool;
 auto canAct(CCharEntity* PChar) -> bool;
 auto act(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, bool travelling, timer::time_point tick) -> bool;

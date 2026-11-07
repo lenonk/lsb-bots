@@ -72,6 +72,7 @@ struct Reply
     std::string       to;
     std::string       text;
     timer::time_point sendAt{};
+    bool              callout{}; // a macro-style announcement, not conversation
 };
 
 struct Shared
@@ -101,6 +102,17 @@ constexpr auto kQuietTime          = std::chrono::minutes(20);
 // Main thread only: party chat by party, players and bots alike, so the brain reads a line in context.
 std::map<uint32, std::deque<std::string>> partyLines;
 constexpr std::size_t                     kPartyLines = 12;
+
+// Main thread only: callouts just sent, "Name|text", so the other bots don't take them for conversation. Kept out of
+// every chat history too: the model copied them, announcing pulls and provokes that never happened.
+std::map<std::string, timer::time_point> recentCallouts;
+constexpr auto                           kCalloutMemory = std::chrono::seconds(30);
+
+auto isCallout(const std::string& from, const std::string& text) -> bool
+{
+    const auto it = recentCallouts.find(fmt::format("{}|{}", from, text));
+    return it != recentCallouts.end() && timer::now() - it->second < kCalloutMemory;
+}
 
 void notePartyLine(const CCharEntity* PSpeaker, const std::string& text)
 {
@@ -817,7 +829,8 @@ void request(const Bot& bot, const uint8 kind, const std::string& to, const bool
         model = fmt::format(R"("model":"{}",)", jsonEscape(name));
     }
 
-    const auto body = fmt::format(R"({{{}"messages":[{}],"max_tokens":48,"temperature":0.8,"top_p":0.9,"min_p":0.05,"presence_penalty":0.3}})", model, messages);
+    const auto body = fmt::format(R"({{{}"messages":[{}],"max_tokens":{},"temperature":0.8,"top_p":0.9,"min_p":0.05,"presence_penalty":0.3}})", model, messages,
+                                  48 + std::max(0, settings::get<int32>("bots.LLM_THINK_TOKENS")));
 
     std::lock_guard lock(shared.mutex);
     if (optional && shared.requests.size() >= kMaxPending)
@@ -876,6 +889,13 @@ void say(Bot& bot, PacketSystem& packets, const Reply& reply)
         chat->Kind   = static_cast<uint8_t>(replyKind(reply.kind));
         std::memcpy(chat->Str, reply.text.data(), std::min(reply.text.size(), sizeof(chat->Str) - 1));
         send(bot, packets, *packet);
+        if (reply.callout)
+        {
+            const auto now = timer::now();
+            std::erase_if(recentCallouts, [&](const auto& entry) { return now - entry.second >= kCalloutMemory; });
+            recentCallouts[fmt::format("{}|{}", bot.name, reply.text)] = now;
+            return;
+        }
         if (isParty(reply.kind))
         {
             notePartyLine(bot.entity(), reply.text);
@@ -896,6 +916,37 @@ std::map<uint64, std::vector<std::pair<uint32, Heard>>> waiting;
 
 void respond(std::vector<Listener>& listeners);
 void carryOut(const std::vector<OrderPlan>& plans, const Heard& heard);
+
+// Who answers a change to what gets pulled: the puller, or a bot the line names to pull, who takes over.
+auto choicePlans(const std::string& note, const std::string& text, CCharEntity* PSpeaker, const std::vector<Bot*>& hearing) -> std::vector<OrderPlan>
+{
+    const auto puller = pullerOf(PSpeaker);
+    const auto named  = std::ranges::find_if(hearing, [&](const Bot* bot) { return mentions(text, bot->name); });
+    if (named != hearing.end() && (*named)->charId != puller && (puller == 0 || saysPhrase(lowerCase(text), { "pull", "pulls", "pulling" })))
+    {
+        return { OrderPlan{ .bot   = *named,
+                            .order = Order{ .kind = OrderKind::Pull, .speakerId = PSpeaker->id, .expires = timer::now() + std::chrono::seconds(20) },
+                            .note  = note + " You're the party's puller now." } };
+    }
+    if (const auto it = std::ranges::find(hearing, puller, &Bot::charId); it != hearing.end())
+    {
+        return { OrderPlan{ .bot = *it, .note = note } };
+    }
+    return { OrderPlan{ .bot = hearing.front(), .note = note + " Nobody is pulling for the party right now, though." } };
+}
+
+// A line about pulling that changes nothing ("you're not pulling!") is answered by the puller, with what it's really doing.
+auto pullerAnswer(const std::string& text, CCharEntity* PSpeaker, const std::vector<Bot*>& hearing) -> std::vector<OrderPlan>
+{
+    const auto puller = PSpeaker != nullptr ? pullerOf(PSpeaker) : 0;
+    const auto it     = std::ranges::find(hearing, puller, &Bot::charId);
+    if (puller == 0 || it == hearing.end() || (*it)->entity() == nullptr ||
+        !(mentions(text, (*it)->name) || saysPhrase(lowerCase(text), { "pull", "pulls", "pulling", "puller" })))
+    {
+        return {};
+    }
+    return { OrderPlan{ .bot = *it, .note = pullReport((*it)->entity()) } };
+}
 
 } // namespace
 
@@ -950,15 +1001,20 @@ void handleChat(std::vector<Bot>& online, const std::set<std::string>& botNames)
             continue;
         }
 
-        auto plans = outcome.plans;
+        std::vector<Bot*> hearing;
+        for (const auto& listener : listeners)
+        {
+            hearing.push_back(listener.bot);
+        }
+        auto* PSpeaker = zoneutils::GetCharByName(listeners.front().heard.from);
+        auto  plans    = outcome.plans;
         if (!outcome.answered)
         {
-            std::vector<Bot*> hearing;
-            for (const auto& listener : listeners)
-            {
-                hearing.push_back(listener.bot);
-            }
-            plans = planOrder(listeners.front().heard.text, zoneutils::GetCharByName(listeners.front().heard.from), hearing);
+            plans = planOrder(listeners.front().heard.text, PSpeaker, hearing);
+        }
+        if (plans.empty())
+        {
+            plans = pullerAnswer(listeners.front().heard.text, PSpeaker, hearing);
         }
 
         if (plans.empty())
@@ -975,7 +1031,7 @@ void handleChat(std::vector<Bot>& online, const std::set<std::string>& botNames)
     {
         for (auto& heard : bot.heard)
         {
-            if (heard.from.empty() || heard.from == bot.name)
+            if (heard.from.empty() || heard.from == bot.name || isCallout(heard.from, heard.text))
             {
                 continue;
             }
@@ -1006,8 +1062,12 @@ void handleChat(std::vector<Bot>& online, const std::set<std::string>& botNames)
                                                 : fmt::format("zone {}", PSender->getZone());
         if (botNames.contains(from))
         {
+            // Not in a party with a real player: there the bots talk to the player, not over each other.
+            const bool playerParty = isParty(kind) && PSender != nullptr && PSender->PParty != nullptr &&
+                                     std::ranges::any_of(PSender->PParty->members, [&](const CBattleEntity* PMember)
+                                                         { return PMember->objtype == TYPE_PC && !botNames.contains(PMember->getName()); });
             auto& run = botRuns[channel];
-            if (isTell(kind) || run >= kMaxBotRun)
+            if (isTell(kind) || run >= kMaxBotRun || playerParty)
             {
                 continue;
             }
@@ -1060,6 +1120,25 @@ void handleChat(std::vector<Bot>& online, const std::set<std::string>& botNames)
                                    listeners.front().bot->entity()->PParty == PSender->PParty;
             if (isParty(kind) || partyTell)
             {
+                // "come back" and "wrong way" are for the puller, unless the line names another bot.
+                const auto& text       = listeners.front().heard.text;
+                const auto  puller     = PSender != nullptr ? pullerOf(PSender) : 0;
+                const bool  otherNamed = std::ranges::any_of(hearing, [&](const Bot* bot) { return bot->charId != puller && mentions(text, bot->name); });
+                if (const auto note = otherNamed ? std::nullopt : recallPuller(text, PSender))
+                {
+                    carryOut(choicePlans(*note, text, PSender, hearing), listeners.front().heard);
+                    continue;
+                }
+                if (const auto note = pullAnyway(text, PSender))
+                {
+                    carryOut(choicePlans(*note, text, PSender, hearing), listeners.front().heard);
+                    continue;
+                }
+                if (const auto note = pullChoice(listeners.front().heard.text, PSender))
+                {
+                    carryOut(choicePlans(*note, listeners.front().heard.text, PSender, hearing), listeners.front().heard);
+                    continue;
+                }
                 if (const auto id = askBrain(listeners.front().heard.text, PSender, hearing); id != 0)
                 {
                     auto& line = waiting[id];
@@ -1071,7 +1150,11 @@ void handleChat(std::vector<Bot>& online, const std::set<std::string>& botNames)
                 }
             }
 
-            const auto plans = planOrder(listeners.front().heard.text, PSender, hearing);
+            auto plans = planOrder(listeners.front().heard.text, PSender, hearing);
+            if (plans.empty() && isParty(kind))
+            {
+                plans = pullerAnswer(listeners.front().heard.text, PSender, hearing);
+            }
             if (!plans.empty())
             {
                 carryOut(plans, listeners.front().heard);
@@ -1187,6 +1270,15 @@ void carryOut(const std::vector<OrderPlan>& plans, const Heard& heard)
             answering.push_back(plan.bot);
         }
         note += (note.empty() ? "" : " ") + plan.note;
+
+        // Told to pull with nothing there to pull: it says so instead of "pulling now".
+        if (plan.order && plan.order->kind == OrderKind::Pull && plan.bot->entity() != nullptr)
+        {
+            if (const auto outlook = pullOutlook(plan.bot->entity()); !outlook.empty())
+            {
+                note += " " + outlook;
+            }
+        }
     }
 
     for (auto* bot : answering)
@@ -1354,7 +1446,7 @@ void callout(const Bot& bot, const std::string& text, const bool macro)
     }
 
     std::lock_guard lock(shared.mutex);
-    shared.replies.push_back({ bot.charId, MESSAGE_PARTY, {}, text, timer::now() });
+    shared.replies.push_back({ bot.charId, MESSAGE_PARTY, {}, text, timer::now(), true });
 }
 
 // A hello on joining a party with a real player; not left to chattiness, but "quiet down" still holds.

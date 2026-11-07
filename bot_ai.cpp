@@ -82,6 +82,14 @@ constexpr uint32 kOutOfMPKey     = 0xB0000; // the mid-fight rest log, once a fi
 
 void sendAction(Bot& bot, PacketSystem& packets, const GP_CLI_COMMAND_ACTION_ACTIONID actionId, const CBaseEntity* PTarget, const uint32 param = 0)
 {
+    // The server refuses these while /healing. Resting decides when to stand (rest(), a monster on the bot); until then they wait.
+    using enum GP_CLI_COMMAND_ACTION_ACTIONID;
+    const bool blockedResting = actionId == Attack || actionId == CastMagic || actionId == JobAbility || actionId == Shoot || actionId == Weaponskill;
+    if (blockedResting && bot.entity() != nullptr && bot.entity()->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::Healing))
+    {
+        return;
+    }
+
     auto  packet     = makePacket<GP_CLI_COMMAND_ACTION>();
     auto* action     = packet->as<GP_CLI_COMMAND_ACTION>();
     action->UniqueNo = PTarget->id;
@@ -706,13 +714,16 @@ void keepRange(CCharEntity* PChar, CBattleEntity* PTarget, const float range, co
 
 // /heal when low and the leader has stopped, or whenever the leader sits down to /heal; stand up when full or the leader moves on.
 // Casters take every spare moment for a tick, missing anything at all; an avatar out would cancel it.
-// Melee keep their TP: they rest only when asked, or when low with no TP to lose or nobody to cure them.
+// Tanks and damage dealers low on HP rest if it costs no TP (Signet working here, or none to lose) or nobody can cure them;
+// otherwise they ask the healer for a cure. Low on MP, they rest once their TP is gone. And whenever told to.
 auto rest(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CCharEntity* PLeader, const timer::time_point tick) -> bool
 {
     const bool resting = PChar->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::Healing);
     const bool full    = PChar->GetHPP() == 100 && (PChar->GetMaxMP() == 0 || PChar->GetMPP() == 100);
     const bool caster  = (isCaster(PChar->GetMJob()) || PChar->GetMJob() == xi::Job::RDM) && PChar->PPet == nullptr;
-    const bool below   = PChar->GetHPP() < kRestHPP || (PChar->GetMaxMP() > 0 && PChar->GetMPP() < kRestMPP);
+    const bool lowHP   = PChar->GetHPP() < kRestHPP;
+    const bool lowMP   = PChar->GetMaxMP() > 0 && PChar->GetMPP() < kRestMPP;
+    const bool keepsTP = signetWorks(PChar) || PChar->health.tp == 0;
     const bool healer  = PChar->PParty != nullptr && std::ranges::any_of(PChar->PParty->members,
                                                                         [&](const CBattleEntity* PMember)
                                                                         {
@@ -720,28 +731,34 @@ auto rest(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CCharEntity* PLea
                                                                             return PMember != PChar && !PMember->isDead() &&
                                                                                    (job == xi::Job::WHM || job == xi::Job::RDM || job == xi::Job::SCH);
                                                                         });
-    const bool low     = bot.restNow || (caster ? !full : below && (PChar->health.tp == 0 || !healer));
+    const bool low     = bot.restNow || (caster ? !full : (lowHP && (keepsTP || !healer)) || (lowMP && (PChar->health.tp == 0 || !healer)));
     if (full)
     {
         bot.restNow = false;
     }
+    if (!caster && lowHP && healer && !keepsTP && !resting)
+    {
+        askForCure(bot, tick);
+    }
 
+    // Sitting down waits for the leader to stop; once down, the bot stays down until the leader actually walks off.
     bool settled       = true;
+    bool near          = true;
     bool leaderResting = false;
     if (PLeader != nullptr)
     {
         leaderResting = PLeader->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::Healing);
         const auto camp = campSpot(PChar);
-        settled         = camp ? distance(PChar->loc.p, *camp) <= kCampSpread
-                               : PLeader->getZone() == PChar->getZone() && distance(PChar->loc.p, PLeader->loc.p) <= kFollowDistance + 2.0f &&
-                          (leaderResting || tick - bot.leaderMovedAt >= kSettleTime);
+        near            = camp ? distance(PChar->loc.p, *camp) <= kCampSpread
+                               : PLeader->getZone() == PChar->getZone() && distance(PChar->loc.p, PLeader->loc.p) <= kFollowDistance + 2.0f;
+        settled         = near && (camp || leaderResting || tick - bot.leaderMovedAt >= kSettleTime);
     }
 
     // Healing comes before resting: spells can't be cast sitting down.
     const bool heal = healingWanted(PChar);
     if (resting)
     {
-        if (full || !settled || heal)
+        if (full || !near || heal)
         {
             setResting(bot, packets, false);
             return false;
@@ -749,7 +766,9 @@ auto rest(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CCharEntity* PLea
         return true;
     }
 
-    if ((low || (caster && leaderResting && !full)) && !heal && settled && canAct(PChar))
+    // Losing HP stands a resting character up, so a bot draining (Sublimation charging, poison) doesn't kneel into it.
+    const bool draining = PChar->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::SublimationActivated) || PChar->getMod(xi::Mod::REGEN_DOWN) > 0;
+    if ((low || (caster && leaderResting && !full)) && !heal && settled && !draining && canAct(PChar))
     {
         PChar->PAI->PathFind->Clear();
         setResting(bot, packets, true);
@@ -1056,6 +1075,12 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
     }
     bot.diedAt = {};
 
+    // Bots always carry Signet: faster resting, no TP lost to it, and the crystals and conquest points it brings.
+    if (!PChar->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::Signet))
+    {
+        PChar->StatusEffectContainer->AddStatusEffectSilent(xi::StatusEffect::Signet, static_cast<uint16>(xi::StatusEffect::Signet), 0, 0s, 0s);
+    }
+
     if (PChar->isInEvent())
     {
         if (!answerEntry(bot, packets, PChar))
@@ -1141,13 +1166,16 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
         return;
     }
 
+    // Moved: across the ground, from where it last stood. Height and small jitter in a client's position don't count.
     if (PGuide != nullptr)
     {
-        if (distance(PGuide->loc.p, bot.leaderLast) >= 0.1f)
+        const float dx = PGuide->loc.p.x - bot.leaderLast.x;
+        const float dz = PGuide->loc.p.z - bot.leaderLast.z;
+        if (dx * dx + dz * dz >= 0.3f * 0.3f)
         {
             bot.leaderMovedAt = tick;
+            bot.leaderLast    = PGuide->loc.p;
         }
-        bot.leaderLast = PGuide->loc.p;
     }
 
     // Mid-cast (or ability, weapon skill, item): a player stands still and waits, or the cast is interrupted.

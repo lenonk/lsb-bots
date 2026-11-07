@@ -18,11 +18,13 @@
 #include "map/items/item_equipment.h"
 #include "map/items/item_weapon.h"
 #include "map/spell.h"
+#include "map/utils/battleutils.h"
 #include "map/utils/blueutils.h"
 #include "map/utils/charutils.h"
 #include "map/utils/itemutils.h"
 
 #include <array>
+#include <set>
 #include <vector>
 
 namespace bots
@@ -37,6 +39,8 @@ constexpr int32 kToolStock     = 10; // ninja tools kept on hand
 constexpr int32 kMedicineStock = 3;  // Echo Drops, Silent Oil and Prism Powder
 constexpr uint16 kAnimator     = 17859;
 constexpr uint16 kAutomatonOil = 18731; // Repair takes it from the ammo slot
+constexpr uint8  kBagSize      = 80;    // the most a player's inventory holds
+constexpr uint8  kBagSpare     = 5;     // loot goes once fewer slots than this are free
 
 // Blue magic worth setting, most wanted first, with the level it comes at.
 constexpr std::array<std::pair<SpellID, uint8>, 19> kBlueSpells = { {
@@ -89,15 +93,29 @@ auto preferredSkills(const xi::Job job) -> std::vector<SkillType>
     }
 }
 
-// Ranged weapon skills, best first; only jobs that fight with one.
-auto rangedSkills(const xi::Job job) -> std::vector<SkillType>
+// Ranged weapon skills, best first. Jobs that don't fight with one still carry one to pull with, by their best ranged skill.
+auto rangedSkills(const xi::Job job, const uint8 level) -> std::vector<SkillType>
 {
     switch (job)
     {
         case xi::Job::RNG: return { SkillType::Archery, SkillType::Marksmanship };
         case xi::Job::COR: return { SkillType::Marksmanship };
-        default: return {};
+        case xi::Job::BRD:
+        case xi::Job::BST:
+        case xi::Job::PUP: return {}; // the slots hold an instrument, a jug or the animator
+        default: break;
     }
+
+    std::vector<SkillType> skills;
+    for (const auto skill : { SkillType::Archery, SkillType::Marksmanship, SkillType::Throwing })
+    {
+        if (battleutils::GetMaxSkill(skill, job, level) > 0)
+        {
+            skills.push_back(skill);
+        }
+    }
+    std::ranges::stable_sort(skills, std::greater{}, [&](const SkillType skill) { return battleutils::GetMaxSkill(skill, job, level); });
+    return skills;
 }
 
 // What an instrument adds to the songs bots sing; all songs counts for each.
@@ -157,7 +175,7 @@ auto planGear(const xi::Job job, const uint8 level, const uint8 race) -> std::ar
     bool       twoHanded   = false;
     std::size_t bestSkill  = skills.size();
 
-    const auto  ranged          = rangedSkills(job);
+    const auto  ranged          = rangedSkills(job, level);
     int32       bestRanged      = -1;
     std::size_t bestRangedSkill = ranged.size();
     int32       bestInstrument  = -1;
@@ -263,8 +281,9 @@ auto planGear(const xi::Job job, const uint8 level, const uint8 race) -> std::ar
         plan[SLOT_SUB] = 0;
     }
 
-    // Ammunition the ranged weapon fires (bows of either kind share arrows), hardest hitting first.
-    if (const auto* PRanged = xi::items::lookup<CItemWeapon>(plan[SLOT_RANGED]); PRanged != nullptr && !ranged.empty())
+    // Ammunition the ranged weapon fires (bows of either kind share arrows), hardest hitting first; a thrown weapon needs none.
+    if (const auto* PRanged = xi::items::lookup<CItemWeapon>(plan[SLOT_RANGED]); PRanged != nullptr && !ranged.empty() &&
+                                                                                 PRanged->getSkillType() != SkillType::Throwing)
     {
         int32 bestAmmo = -1;
         for (const auto* PAmmo : ammo)
@@ -453,6 +472,12 @@ void prepare(Bot& bot, sol::state& lua)
     // Items go through the Lua API, the same path GM commands use.
     std::string script = fmt::format("local p = GetPlayerByID({})\nif p == nil then return end\np:capAllSkills()\np:setNewPlayer(false)\n", PChar->id);
 
+    // A full bag fails every addItem below without a word: a samurai never got its bow.
+    if (const auto size = PChar->getStorage(LOC_INVENTORY)->GetSize(); size < kBagSize)
+    {
+        script += fmt::format("p:changeContainerSize({}, {})\n", static_cast<uint8>(LOC_INVENTORY), kBagSize - size);
+    }
+
     // The dice for each roll; the game hands out a roll only once its level comes.
     if (PChar->GetMJob() == xi::Job::COR || PChar->GetSJob() == xi::Job::COR)
     {
@@ -496,6 +521,20 @@ void restock(Bot& bot, sol::state& lua, const timer::time_point tick)
     }
 
     std::string script;
+
+    // Loot piles up until nothing fits, ammunition and medicine included; bots have no use for it.
+    if (auto* PBag = PChar->getStorage(LOC_INVENTORY); PBag->GetFreeSlotsCount() < kBagSpare)
+    {
+        static const std::set<uint16> kKept = { kEchoDrops, kSilentOil, kPrismPowder, kAutomatonOil, static_cast<uint16>(ITEMID::SHIHEI) };
+        for (uint8 slot = 1; slot <= PBag->GetSize(); ++slot)
+        {
+            if (const auto* PItem = PBag->GetItem(slot); PItem != nullptr && !PItem->isType(ITEM_EQUIPMENT) && !kKept.contains(PItem->getID()))
+            {
+                script += fmt::format("p:delItem({}, {})\n", PItem->getID(), PItem->getQuantity());
+            }
+        }
+    }
+
     if (bot.ammoId != 0 && PChar->getEquip(SLOT_AMMO) == nullptr)
     {
         script += fmt::format("if not p:hasItem({0}) then p:addItem({{ id = {0}, quantity = {1}, silent = true }}) end\np:equipItem({0}, nil, {2})\n",

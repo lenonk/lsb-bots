@@ -28,6 +28,7 @@ xi.settings.bots =
     LLM_API_KEY  = '', -- sent as "Authorization: Bearer <key>" when set
     LLM_MODEL    = '', -- required by hosted APIs; llama-server ignores it
     LLM_TIMEOUT  = 30, -- seconds
+    LLM_THINK_TOKENS = 0, -- added to each reply's token limit for a reasoning model, whose thinking counts against it; 0 for others
     LLM_ORDERS   = true, -- the model reads party chat for requests and picks which bot does what; false uses keyword matching
 
     CHAT_PARTY_MINUTES = 4,  -- About this often a bot in your party starts some small talk (and sometimes after a fight). 0 turns it off

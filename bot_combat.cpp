@@ -620,10 +620,16 @@ auto isSquishy(const Job job) -> bool
 
 auto heal(Bot& bot, PacketSystem& packets, const std::vector<CBattleEntity*>& members, const uint8 threshold, const timer::time_point tick) -> bool
 {
+    // The party's healer also cures anyone who asked; after anyone in danger, they come first.
+    auto*      PChar   = bot.entity();
+    const bool healer  = partyHealer(PChar) == PChar;
+    const auto asked   = [&](const CBattleEntity* PMember) { return healer && PMember->GetHPP() < 100 && askedForCure(PMember->id, tick); };
+    const auto urgency = [&](const CBattleEntity* PMember) { return std::pair(PMember->GetHPP() < kEmergencyHPP ? 0 : asked(PMember) ? 1 : 2, PMember->GetHPP()); };
+
     CBattleEntity* PWorst = nullptr;
     for (auto* PMember : members)
     {
-        if (PMember->GetHPP() < threshold && (PWorst == nullptr || PMember->GetHPP() < PWorst->GetHPP()))
+        if ((PMember->GetHPP() < threshold || asked(PMember)) && (PWorst == nullptr || urgency(PMember) < urgency(PWorst)))
         {
             PWorst = PMember;
         }
@@ -1343,9 +1349,12 @@ auto upkeep(Bot& bot, PacketSystem& packets, const std::vector<CBattleEntity*>& 
         {
             return true;
         }
-        // Sublimation charges on HP, then pays out as MP.
-        return (!effect(StatusEffect::SublimationActivated) && !effect(StatusEffect::SublimationComplete) && PChar->GetHPP() > 60 && self(ABILITY_SUBLIMATION)) ||
-               (effect(StatusEffect::SublimationComplete) && PChar->GetMPP() < 75 && self(ABILITY_SUBLIMATION));
+        // Sublimation charges on HP, then pays out as MP. It charges in fights only: its HP drain stands a resting bot up,
+        // so out of a fight whatever it has stored is taken, and the bot rests.
+        return (PTarget != nullptr && !effect(StatusEffect::SublimationActivated) && !effect(StatusEffect::SublimationComplete) && PChar->GetHPP() > 60 &&
+                self(ABILITY_SUBLIMATION)) ||
+               (effect(StatusEffect::SublimationComplete) && PChar->GetMPP() < 75 && self(ABILITY_SUBLIMATION)) ||
+               (PTarget == nullptr && effect(StatusEffect::SublimationActivated) && PChar->GetMPP() < 100 && self(ABILITY_SUBLIMATION));
     }
 
     if (job == Job::GEO && !town && (bot.directives.restraints & kNoBuffs) == 0)
@@ -1874,6 +1883,44 @@ auto partyHealer(CCharEntity* PChar) -> CBattleEntity*
     return PBest;
 }
 
+// As scripts/effects/healing.lua has it: Signet in the old regions, Sigil on the Crystal War fronts.
+auto signetWorks(const CBattleEntity* PEntity) -> bool
+{
+    if (PEntity->loc.zone == nullptr)
+    {
+        return false;
+    }
+    const auto region = PEntity->loc.zone->GetRegionID();
+    return (region <= xi::Region::Limbus && PEntity->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::Signet)) ||
+           (region >= xi::Region::RonfaureFront && region <= xi::Region::ValdeauniaFront && PEntity->StatusEffectContainer->HasStatusEffect(xi::StatusEffect::Sigil));
+}
+
+namespace
+{
+
+// Who asked for a cure and when. Asks are renewed every tick while still needed, so a stale one is a met one.
+std::map<uint32, timer::time_point> cureAsks;
+constexpr auto                      kAskLasts   = std::chrono::seconds(5);
+constexpr uint32                    kAskCureKey = 0xC0000;
+
+} // namespace
+
+void askForCure(Bot& bot, const timer::time_point tick)
+{
+    cureAsks[bot.charId] = tick;
+    if (throttle(bot, kAskCureKey, bot.charId, std::chrono::minutes(2), tick))
+    {
+        static constexpr std::array<const char*, 4> lines = { "cure pls", "can i get a cure?", "need a cure when you get a sec", "heal pls" };
+        callout(bot, lines[xirand::GetRandomNumber<std::size_t>(lines.size())], false);
+    }
+}
+
+auto askedForCure(const uint32 charId, const timer::time_point tick) -> bool
+{
+    const auto it = cureAsks.find(charId);
+    return it != cureAsks.end() && tick - it->second < kAskLasts;
+}
+
 // For !bot: this bot's hate on its target against whoever holds it.
 auto hateStatus(CCharEntity* PChar, CBattleEntity* PTarget) -> std::string
 {
@@ -1915,6 +1962,7 @@ auto healingWanted(CCharEntity* PChar) -> bool
                                        return raises;
                                    }
                                    return PMember->GetHPP() < threshold ||
+                                          (PMember->GetHPP() < 100 && askedForCure(PMember->id, timer::now()) && partyHealer(PChar) == PChar) ||
                                           (job == Job::WHM &&
                                            std::ranges::any_of(kCleanses, [&](const Cleanse& c) { return PMember->StatusEffectContainer->HasStatusEffect(c.effect); }));
                                });
@@ -2238,7 +2286,7 @@ auto deadToRaise(CCharEntity* PChar) -> CCharEntity*
 // How far the puller can open from: a ranged attack or Dia from casting range, Provoke a little closer; 0 for melee only.
 auto pullRange(CCharEntity* PChar) -> float
 {
-    if (isRanged(PChar) || spell::CanUseSpell(PChar, SpellID::Dia) || spell::CanUseSpell(PChar, SpellID::Battlefield_Elegy) ||
+    if (canShoot(PChar) || spell::CanUseSpell(PChar, SpellID::Dia) || spell::CanUseSpell(PChar, SpellID::Battlefield_Elegy) ||
         spell::CanUseSpell(PChar, SpellID::Foe_Requiem))
     {
         return 18.0f;
@@ -2246,12 +2294,25 @@ auto pullRange(CCharEntity* PChar) -> float
     return charutils::hasAbility(PChar, ABILITY_PROVOKE) ? 14.0f : 0.0f;
 }
 
-// Bards pull with Elegy: it lands from range and slows the monster on the way in; Requiem before it's learnt.
+// Bards pull with Elegy: it lands from range and slows the monster on the way in; Requiem before it's learnt. Anyone
+// carrying a bow, gun or thrown weapon shoots: a miss claims it too.
 auto openPull(Bot& bot, PacketSystem& packets, CBattleEntity* PMob, const timer::time_point tick) -> bool
 {
+    const auto pullShot = [&]
+    {
+        auto* PChar = bot.entity();
+        if (!canShoot(PChar) || (bot.directives.restraints & kNoRanged) || distance(PChar->loc.p, PMob->loc.p) > PChar->GetRangedAttackRange() ||
+            !throttle(bot, kShootKey, PMob->id, std::chrono::seconds(1), tick))
+        {
+            return false;
+        }
+        rangedAttack(bot, packets, PMob);
+        return true;
+    };
+
     return castBest(bot, packets, { SpellID::Carnage_Elegy, SpellID::Battlefield_Elegy, SpellID::Foe_Requiem_III, SpellID::Foe_Requiem_II, SpellID::Foe_Requiem },
                     PMob, std::chrono::seconds(5), tick) ||
-           shoot(bot, packets, PMob, tick) || tryAbility(bot, packets, ABILITY_PROVOKE, PMob, tick) ||
+           pullShot() || tryAbility(bot, packets, ABILITY_PROVOKE, PMob, tick) ||
            castBest(bot, packets, { SpellID::Dia_II, SpellID::Dia }, PMob, std::chrono::seconds(5), tick);
 }
 
@@ -2362,6 +2423,19 @@ auto isRanged(CCharEntity* PChar) -> bool
     const auto* PRanged = dynamic_cast<CItemWeapon*>(PChar->getEquip(SLOT_RANGED));
     return PRanged != nullptr && PChar->getEquip(SLOT_AMMO) != nullptr &&
            (PRanged->getSkillType() == xi::SkillType::Archery || PRanged->getSkillType() == xi::SkillType::Marksmanship);
+}
+
+// Something to fire, whatever the job: a bow or gun with ammunition, or a thrown weapon.
+auto canShoot(CCharEntity* PChar) -> bool
+{
+    const auto* PRanged = dynamic_cast<CItemWeapon*>(PChar->getEquip(SLOT_RANGED));
+    if (PRanged == nullptr)
+    {
+        return false;
+    }
+    const auto skill = PRanged->getSkillType();
+    return skill == xi::SkillType::Throwing ||
+           ((skill == xi::SkillType::Archery || skill == xi::SkillType::Marksmanship) && PChar->getEquip(SLOT_AMMO) != nullptr);
 }
 
 auto canAct(CCharEntity* PChar) -> bool

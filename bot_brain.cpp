@@ -325,8 +325,13 @@ struct ToolCall
 struct Job_
 {
     uint64      id{};
-    std::string body;
+    std::string head; // the request up to the end of its messages
+    std::string tail; // the tools and settings after them
 };
+
+// gpt-oss makes one call per answer: after a lone call it hears that's done and is asked again.
+constexpr int              kMaxRounds = 3;
+constexpr std::string_view kDone      = "Done. Call another tool only for something else the line asks for in so many words; otherwise call no_action.";
 
 struct Result
 {
@@ -358,33 +363,66 @@ void worker()
             shared.jobs.pop_front();
         }
 
-        Result result{ .id = job.id };
-        const auto reply = httpPost(settings::get<std::string>("bots.LLM_URL"), settings::get<std::string>("bots.LLM_API_KEY"), job.body,
-                                    std::max(5, settings::get<int32>("bots.LLM_TIMEOUT")));
-        const auto json  = reply.status == 200 ? JsonReader(reply.body).read() : std::nullopt;
-        const auto* message = json && json->get("choices") && json->get("choices")->at(0) ? json->get("choices")->at(0)->get("message") : nullptr;
-        if (message != nullptr)
+        Result                                           result{ .id = job.id };
+        const auto                                       timeout  = std::max(5, settings::get<int32>("bots.LLM_TIMEOUT"));
+        const auto                                       deadline = timer::now() + std::chrono::seconds(timeout);
+        std::string                                      more; // later rounds: the calls so far and their results
+        std::vector<std::pair<std::string, std::string>> seen; // name and arguments of each call
+        for (int round = 0; round < kMaxRounds; ++round)
         {
-            result.answered = true;
-            if (const auto* calls = message->get("tool_calls"))
+            const auto left = std::chrono::duration_cast<std::chrono::seconds>(deadline - timer::now()).count();
+            if (round > 0 && left < 3)
             {
-                for (std::size_t i = 0; i < calls->size(); ++i)
-                {
-                    const auto* function = calls->at(i)->get("function");
-                    if (function == nullptr || function->get("name") == nullptr)
-                    {
-                        continue;
-                    }
-                    // Arguments come as a JSON string holding a JSON object.
-                    const auto text = function->get("arguments") ? function->get("arguments")->str() : std::string("{}");
-                    auto       args = JsonReader(text.empty() ? std::string("{}") : text).read();
-                    result.calls.push_back(ToolCall{ function->get("name")->str(), args ? std::move(*args) : Json{ Json::Object{} } });
-                }
+                break;
             }
-        }
-        else
-        {
-            ShowWarningFmt("bots: the party brain got no usable answer (HTTP {}): {}", reply.status, reply.body.substr(0, 200));
+            const auto reply = httpPost(settings::get<std::string>("bots.LLM_URL"), settings::get<std::string>("bots.LLM_API_KEY"), job.head + more + job.tail,
+                                        round == 0 ? timeout : static_cast<int32>(left));
+            const auto json  = reply.status == 200 ? JsonReader(reply.body).read() : std::nullopt;
+            const auto* message = json && json->get("choices") && json->get("choices")->at(0) ? json->get("choices")->at(0)->get("message") : nullptr;
+            if (message == nullptr)
+            {
+                if (round == 0)
+                {
+                    ShowWarningFmt("bots: the party brain got no usable answer (HTTP {}): {}", reply.status, reply.body.substr(0, 200));
+                }
+                break;
+            }
+            result.answered = true;
+
+            const auto* calls = message->get("tool_calls");
+            int         real     = 0;
+            bool        repeated = false;
+            for (std::size_t i = 0; calls != nullptr && i < calls->size(); ++i)
+            {
+                const auto* function = calls->at(i)->get("function");
+                if (function == nullptr || function->get("name") == nullptr)
+                {
+                    continue;
+                }
+                // Arguments come as a JSON string holding a JSON object.
+                const auto name = function->get("name")->str();
+                const auto text = function->get("arguments") ? function->get("arguments")->str() : std::string("{}");
+                if (round > 0 && (name == "no_action" || std::ranges::contains(seen, std::pair{ name, text })))
+                {
+                    repeated = repeated || name != "no_action";
+                    continue;
+                }
+                auto args = JsonReader(text.empty() ? std::string("{}") : text).read();
+                result.calls.push_back(ToolCall{ name, args ? std::move(*args) : Json{ Json::Object{} } });
+                seen.emplace_back(name, text);
+                real += name != "no_action";
+            }
+            if (calls == nullptr || calls->size() != 1 || real != 1 || repeated)
+            {
+                break;
+            }
+
+            const auto* call      = calls->at(0);
+            const auto  id        = call->get("id") ? call->get("id")->str() : std::string("call_0");
+            const auto  reasoning = message->get("reasoning_content") ? message->get("reasoning_content")->str() : std::string{};
+            more += fmt::format(R"(,{{"role":"assistant","content":"","reasoning_content":"{}","tool_calls":[{{"id":"{}","type":"function","function":{{"name":"{}","arguments":"{}"}}}}]}})",
+                                escape(reasoning), escape(id), escape(seen.back().first), escape(seen.back().second));
+            more += fmt::format(R"(,{{"role":"tool","tool_call_id":"{}","content":"{}"}})", escape(id), kDone);
         }
 
         std::lock_guard lock(shared.mutex);
@@ -648,8 +686,9 @@ auto roster(CCharEntity* PSpeaker, const std::vector<Bot*>& bots) -> std::string
     }
 
     const auto camp   = campSpot(PSpeaker);
-    out += fmt::format("Now: {}. {}. Fighting: {}.", PSpeaker->loc.zone ? prettyName(PSpeaker->loc.zone->getName()) : std::string("somewhere"),
-                       camp ? "Camp is set" : "No camp set", fightingName(PSpeaker));
+    const auto choice = pullChoiceText(PSpeaker);
+    out += fmt::format("Now: {}. {}.{} Fighting: {}.", PSpeaker->loc.zone ? prettyName(PSpeaker->loc.zone->getName()) : std::string("somewhere"),
+                       camp ? "Camp is set" : "No camp set", choice.empty() ? "" : " " + choice, fightingName(PSpeaker));
     if (const auto* PTank = mainTank(PSpeaker); PTank != nullptr)
     {
         out += fmt::format(" Main tank: {}.", PTank->getName());
@@ -677,6 +716,9 @@ constexpr std::string_view kRules =
     "  go by what they do.\n"
     "- stop_using and resume for \"don't nuke\", \"no more sleep\", \"you can ws again\"; reset_instructions for \"back to normal\";\n"
     "  set_tank when they say who tanks.\n"
+    "- A line that asks for several things (\"pro and shell\", \"stop pulling, Aldric you pull\") gets a call for each.\n"
+    "- A whole kind (\"no more songs\", \"don't nuke\") is one stop_using call naming the kind, not one per spell.\n"
+    "- A summoner keeps an avatar out with keep_up (\"keep Garuda out\"); \"release\" or \"dismiss\" the avatar is stop_using pets.\n"
     "- Earlier chat is context; act on the latest line. A correction (\"no, I want X\") replaces what was asked before it.\n\n";
 
 auto tools(const std::vector<std::string>& botNames, const std::vector<std::string>& memberNames) -> std::string
@@ -992,6 +1034,13 @@ auto plansFor(const std::vector<ToolCall>& calls, const std::string& text, CChar
         }
         else if (call.name == "break_camp")
         {
+            // The model took "you're standing still in the camp!" for this; the camp goes only when the line says to leave it.
+            if (!saysPhrase(lowered(text), { "break", "breaking", "leave", "leaving", "move", "moving", "pack up", "packing up", "let's go", "lets go", "follow me",
+                                             "new camp", "relocate", "head out", "heading out", "move on", "moving on", "done here", "camp elsewhere" }))
+            {
+                ShowInfoFmt("bots: the party brain wanted camp broken on \"{}\", which doesn't say to", text);
+                continue;
+            }
             const auto first = plans.size();
             everyone(OrderKind::Follow, "leave camp and follow the leader", bots);
             for (auto i = first; i < plans.size(); ++i)
@@ -1001,10 +1050,31 @@ auto plansFor(const std::vector<ToolCall>& calls, const std::string& text, CChar
         }
         else if (call.name == "stop_pulling" && !bots.empty())
         {
+            // The model also calls it for "bats only" and "I said pull beetles"; pulling stops only when the line says so.
+            if (!saysPhrase(lowered(text), { "stop", "pause", "hold", "wait", "enough", "quit", "no more", "don't pull", "dont pull", "do not pull", "i'll pull",
+                                             "ill pull", "i will pull", "i pull", "let me pull", "break" }))
+            {
+                ShowInfoFmt("bots: the party brain wanted pulls stopped on \"{}\", which doesn't say to", text);
+                continue;
+            }
             plans.push_back(OrderPlan{ .bot = bots.front(), .order = order(OrderKind::StopPull), .note = "The party just stopped having a bot pull." });
         }
         else if (call.name == "assign_puller")
         {
+            // The model takes "you keep pulling hate" for pulls; a line whose only pulling is hate gets no puller.
+            auto pulls = lowered(text);
+            for (const std::string_view hate : { "pulling hate", "pulls hate", "pull hate", "pulled hate", "pulling aggro", "pull aggro", "pulling the hate" })
+            {
+                for (auto at = pulls.find(hate); at != std::string::npos; at = pulls.find(hate))
+                {
+                    pulls.erase(at, hate.size());
+                }
+            }
+            if (pulls != lowered(text) && !saysPhrase(pulls, { "pull", "pulls", "pulling", "puller" }))
+            {
+                ShowInfoFmt("bots: the party brain wanted a puller on \"{}\", which is about hate", text);
+                continue;
+            }
             if (auto* bot = findBot(bots, arg("bot")); bot != nullptr)
             {
                 plans.push_back(OrderPlan{ .bot = bot, .order = order(OrderKind::Pull), .note = doing("pull monsters back to camp for the party") });
@@ -1317,14 +1387,15 @@ auto askBrain(const std::string& text, CCharEntity* PSpeaker, const std::vector<
     const auto said = earlier.empty() ? line : fmt::format("Earlier party chat, for context:\n{}\n\nThe line to act on:\n{}", fmt::join(earlier, "\n"), line);
 
     const auto system = fmt::format("{}{}", kRules, roster(PSpeaker, bots));
-    const auto body   = fmt::format(R"({{{}"messages":[{{"role":"system","content":"{}"}},{{"role":"user","content":"{}"}}],"tools":{},"tool_choice":"required","max_tokens":300,"temperature":0}})",
-                                    model, escape(system), escape(said), tools(botNames, memberNames));
+    const auto head   = fmt::format(R"({{{}"messages":[{{"role":"system","content":"{}"}},{{"role":"user","content":"{}"}})", model, escape(system), escape(said));
+    const auto tail   = fmt::format(R"(],"tools":{},"tool_choice":"required","max_tokens":{},"temperature":0}})", tools(botNames, memberNames),
+                                    300 + std::max(0, settings::get<int32>("bots.LLM_THINK_TOKENS")));
 
     const auto id = nextId++;
     contexts[id]  = Context{ text, PSpeaker->getName(), botIds };
 
     std::lock_guard lock(shared.mutex);
-    shared.jobs.push_back(Job_{ id, body });
+    shared.jobs.push_back(Job_{ id, head, tail });
     shared.wake.notify_one();
     return id;
 }
