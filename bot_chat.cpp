@@ -697,11 +697,11 @@ auto describe(const Bot& bot, const bool places = false) -> std::string
     if (PChar->PParty)
     {
         std::vector<std::string> members;
-        for (auto* PMember : PChar->PParty->members)
+        for (auto* PMember : withTrusts(PChar))
         {
             const auto memberJob = static_cast<std::size_t>(PMember->GetMJob());
-            auto       line      = fmt::format("{}{} {}{}", PMember == PChar ? "you, " : "", PMember->getName(), memberJob < shortJobs.size() ? shortJobs[memberJob] : "?",
-                                               PMember->GetMLevel());
+            auto       line      = fmt::format("{}{}{} {}{}", PMember == PChar ? "you, " : "", memberName(PMember), PMember->objtype == TYPE_TRUST ? " (a trust)" : "",
+                                               memberJob < shortJobs.size() ? shortJobs[memberJob] : "?", PMember->GetMLevel());
             if (PMember->isDead())
             {
                 line += ", dead";
@@ -728,7 +728,7 @@ auto describe(const Bot& bot, const bool places = false) -> std::string
     {
         const auto* PVictim = PFight->GetBattleTarget();
         situation += fmt::format("\n- Fighting: {} at {}% HP{}.", spaced(PFight->getName()), PFight->GetHPP(),
-                                 PVictim ? fmt::format(", attacking {}", PVictim == PChar ? std::string("you") : PVictim->getName()) : std::string());
+                                 PVictim ? fmt::format(", attacking {}", PVictim == PChar ? std::string("you") : memberName(PVictim)) : std::string());
     }
 
     // What the party told it, and a bard's songs, so it answers about them truthfully.

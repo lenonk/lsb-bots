@@ -216,7 +216,7 @@ auto inParty(const CCharEntity* PChar, const CBattleEntity* PEntity) -> bool
     {
         return true;
     }
-    return PChar->PParty != nullptr && std::ranges::contains(PChar->PParty->members, PEntity);
+    return PChar->PParty != nullptr && std::ranges::contains(withTrusts(PChar), PEntity);
 }
 
 // The leader's target, or else the nearest mob attacking anyone in the party.
@@ -592,7 +592,7 @@ auto partyCanRaise(CCharEntity* PChar) -> bool
 // A group that is together and healthy enough for the next pull.
 auto partyReady(CCharEntity* PLeader) -> bool
 {
-    return std::ranges::all_of(PLeader->PParty->members,
+    return std::ranges::all_of(withTrusts(PLeader),
                                [&](const CBattleEntity* PMember)
                                {
                                    return PMember->getZone() == PLeader->getZone() && !PMember->isDead() && PMember->GetHPP() >= 70 &&
@@ -617,7 +617,7 @@ auto huntTarget(Bot& bot, CCharEntity* PChar, const timer::time_point tick) -> C
     }
 
     const int   level    = PChar->GetMLevel();
-    const int   toughest = PChar->PParty != nullptr && PChar->PParty->members.size() >= 3 ? 3 : 1;
+    const int   toughest = PChar->PParty != nullptr && withTrusts(PChar).size() >= 3 ? 3 : 1;
     CMobEntity* PBest    = nullptr;
     PChar->loc.zone->ForEachMob(
         [&](CMobEntity* PMob)
@@ -724,7 +724,7 @@ auto rest(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CCharEntity* PLea
     const bool lowHP   = PChar->GetHPP() < kRestHPP;
     const bool lowMP   = PChar->GetMaxMP() > 0 && PChar->GetMPP() < kRestMPP;
     const bool keepsTP = signetWorks(PChar) || PChar->health.tp == 0;
-    const bool healer  = PChar->PParty != nullptr && std::ranges::any_of(PChar->PParty->members,
+    const bool healer  = PChar->PParty != nullptr && std::ranges::any_of(withTrusts(PChar),
                                                                         [&](const CBattleEntity* PMember)
                                                                         {
                                                                             const auto job = PMember->GetMJob();
@@ -1053,6 +1053,7 @@ void think(Bot& bot, PacketSystem& packets, const std::set<uint32>& botIds, cons
     {
         return;
     }
+    watchPull(PChar);
 
     if (PChar->isDead())
     {

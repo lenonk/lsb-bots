@@ -9,7 +9,7 @@
 
 #include "common/database.h"
 #include "common/logging.h"
-#include "common/scheduler.h"
+#include "common/scheduler/scheduler.h"
 #include "common/settings.h"
 #include "common/xirand.h"
 
@@ -121,19 +121,32 @@ class BotModule : public CPPModule
             return false;
         }
 
-        const auto* invite = packet.as<GP_CLI_COMMAND_GROUP_SOLICIT_REQ>();
+        auto*      invite = packet.as<GP_CLI_COMMAND_GROUP_SOLICIT_REQ>();
+        const auto it     = std::ranges::find_if(online_,
+                                                 [&](const auto& bot)
+                                                 {
+                                                     return bot.charId == invite->UniqueNo;
+                                                 });
+
+        if (it == online_.end() || it->entity() == nullptr)
+        {
+            return false;
+        }
+
+        // An invite from a search result goes out as an alliance invite when the target leads a party.
+        // Bots never accept those, so it becomes a party invite.
+        if (invite->Kind == PartyKind::Alliance)
+        {
+            ShowInfoFmt("bots: {}'s alliance invite to {} is taken as a party invite", PChar->getName(), it->name);
+            invite->Kind = PartyKind::Party;
+        }
+
         if (invite->Kind != PartyKind::Party)
         {
             return false;
         }
 
-        const auto it = std::ranges::find_if(online_,
-                                             [&](const auto& bot)
-                                             {
-                                                 return bot.charId == invite->UniqueNo;
-                                             });
-
-        if (it != online_.end() && it->entity() != nullptr && it->entity()->PParty != nullptr && it->entity()->PParty != PChar->PParty)
+        if (it->entity()->PParty != nullptr && it->entity()->PParty != PChar->PParty)
         {
             ShowInfoFmt("bots: {} leaves its party for {}'s invite", it->name, PChar->getName());
             bots::leaveParty(*it, *packets_);

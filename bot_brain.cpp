@@ -583,7 +583,7 @@ auto tankPreference(const Job job) -> int
 auto fightingName(CCharEntity* PSpeaker) -> std::string
 {
     auto* PTarget = PSpeaker->GetBattleTarget();
-    for (auto* PMember : PSpeaker->PParty->members)
+    for (auto* PMember : withTrusts(PSpeaker))
     {
         if (PTarget == nullptr && PMember->PAI->IsEngaged())
         {
@@ -596,13 +596,14 @@ auto fightingName(CCharEntity* PSpeaker) -> std::string
 auto roster(CCharEntity* PSpeaker, const std::vector<Bot*>& bots) -> std::string
 {
     std::string out = "Party (leader first):\n";
-    std::vector<CBattleEntity*> members(PSpeaker->PParty->members.begin(), PSpeaker->PParty->members.end());
+    auto members = withTrusts(PSpeaker);
     std::ranges::stable_partition(members, [&](const CBattleEntity* PMember) { return PMember == PSpeaker->PParty->GetLeader(); });
 
     for (auto* PMember : members)
     {
         const bool isBot = std::ranges::any_of(bots, [&](const Bot* bot) { return bot->charId == PMember->id; });
-        out += fmt::format("- {}: {}, {} {}{}.", PMember->getName(), isBot ? "bot" : "real player", jobName(PMember->GetMJob()), PMember->GetMLevel(),
+        const auto* kind = isBot ? "bot" : PMember->objtype == TYPE_TRUST ? "trust (fights on its own, takes no orders)" : "real player";
+        out += fmt::format("- {}: {}, {} {}{}.", memberName(PMember), kind, jobName(PMember->GetMJob()), PMember->GetMLevel(),
                            PMember == PSpeaker->PParty->GetLeader() ? ", the leader" : "");
         out += PMember->isDead() ? " Dead." : fmt::format(" HP {}%{}.", PMember->GetHPP(), PMember->GetMaxMP() > 0 ? fmt::format(", MP {}%", PMember->GetMPP()) : "");
 
@@ -691,7 +692,7 @@ auto roster(CCharEntity* PSpeaker, const std::vector<Bot*>& bots) -> std::string
                        camp ? "Camp is set" : "No camp set", choice.empty() ? "" : " " + choice, fightingName(PSpeaker));
     if (const auto* PTank = mainTank(PSpeaker); PTank != nullptr)
     {
-        out += fmt::format(" Main tank: {}.", PTank->getName());
+        out += fmt::format(" Main tank: {}.", memberName(PTank));
     }
     return out;
 }
@@ -902,9 +903,9 @@ auto keepFor(const Wanted& wanted, const std::string& target, CCharEntity* PSpea
     }
 
     CBattleEntity* PMember = PSpeaker;
-    for (auto* POther : PSpeaker->PParty->members)
+    for (auto* POther : withTrusts(PSpeaker))
     {
-        if (lowered(POther->getName()) == named)
+        if (namedAs(POther, named))
         {
             PMember = POther;
         }
@@ -937,8 +938,21 @@ auto whomText(const KeepFor who, const uint32 memberId, const Bot& bot) -> std::
             {
                 return "yourself";
             }
-            const auto* PMember = zoneutils::GetChar(memberId);
-            return PMember != nullptr ? PMember->getName() : std::string("them");
+            if (const auto* PMember = zoneutils::GetChar(memberId); PMember != nullptr)
+            {
+                return PMember->getName();
+            }
+            if (const auto* PChar = zoneutils::GetChar(bot.charId); PChar != nullptr)
+            {
+                for (const auto* PMember : withTrusts(PChar))
+                {
+                    if (PMember->id == memberId)
+                    {
+                        return memberName(PMember);
+                    }
+                }
+            }
+            return "them";
         }
         case KeepFor::Melee: return "the melee";
         case KeepFor::Mages: return "the mages";
@@ -1215,15 +1229,16 @@ auto plansFor(const std::vector<ToolCall>& calls, const std::string& text, CChar
             std::vector<uint32> targets;
             if (target == "everyone")
             {
-                for (const auto* PMember : PSpeaker->PParty->members)
+                for (const auto* PMember : withTrusts(PSpeaker))
                 {
                     targets.push_back(PMember->id);
                 }
             }
             else if (!onMonster)
             {
-                const auto member = std::ranges::find_if(PSpeaker->PParty->members, [&](const CBattleEntity* PMember) { return lowered(PMember->getName()) == target; });
-                targets.push_back(member != PSpeaker->PParty->members.end() ? (*member)->id : PSpeaker->id);
+                const auto members = withTrusts(PSpeaker);
+                const auto member  = std::ranges::find_if(members, [&](const CBattleEntity* PMember) { return namedAs(PMember, target); });
+                targets.push_back(member != members.end() ? (*member)->id : PSpeaker->id);
             }
 
             auto cast    = order(OrderKind::Cast);
@@ -1318,9 +1333,9 @@ auto plansFor(const std::vector<ToolCall>& calls, const std::string& text, CChar
         else if (call.name == "set_tank" && !bots.empty())
         {
             CBattleEntity* PTank = PSpeaker;
-            for (auto* PMember : PSpeaker->PParty->members)
+            for (auto* PMember : withTrusts(PSpeaker))
             {
-                if (lowered(PMember->getName()) == lowered(arg("member")))
+                if (namedAs(PMember, arg("member")))
                 {
                     PTank = PMember;
                 }
@@ -1328,7 +1343,7 @@ auto plansFor(const std::vector<ToolCall>& calls, const std::string& text, CChar
             // Already the tank: most likely a question ("who's tanking?"), so it's only answered.
             if (const auto* PNow = mainTank(PSpeaker); PNow == PTank)
             {
-                plans.push_back(OrderPlan{ .bot = bots.front(), .note = fmt::format("{} is the party's main tank.", PTank->getName()) });
+                plans.push_back(OrderPlan{ .bot = bots.front(), .note = fmt::format("{} is the party's main tank.", memberName(PTank)) });
                 continue;
             }
             setMainTank(PSpeaker->PParty->GetPartyID(), PTank->id);
@@ -1336,7 +1351,7 @@ auto plansFor(const std::vector<ToolCall>& calls, const std::string& text, CChar
             const auto tanker = std::ranges::find(bots, PTank->id, &Bot::charId);
             plans.push_back(tanker != bots.end()
                                 ? OrderPlan{ .bot = *tanker, .note = "You were just made the party's main tank: you hold hate, and the others leave it to you." }
-                                : OrderPlan{ .bot = bots.front(), .note = fmt::format("{} is the party's main tank now; the bots leave hate to them.", PTank->getName()) });
+                                : OrderPlan{ .bot = bots.front(), .note = fmt::format("{} is the party's main tank now; the bots leave hate to them.", memberName(PTank)) });
         }
     }
     return plans;
@@ -1362,9 +1377,9 @@ auto askBrain(const std::string& text, CCharEntity* PSpeaker, const std::vector<
         botIds.push_back(bot->charId);
     }
     std::vector<std::string> memberNames;
-    for (const auto* PMember : PSpeaker->PParty->members)
+    for (const auto* PMember : withTrusts(PSpeaker))
     {
-        memberNames.push_back(PMember->getName());
+        memberNames.push_back(memberName(PMember));
     }
 
     std::string model;

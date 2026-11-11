@@ -23,9 +23,35 @@ constexpr std::array<std::string_view, 23> jobColumns = {
     "sam", "nin", "drg", "smn", "blu", "cor", "pup", "dnc", "sch", "geo", "run",
 };
 
-auto nextId(const char* query) -> uint32
+// A job's level, unlocked and genkai, indexed by job id - 1 (queries must be literals)
+constexpr std::array<db::Query, 22> jobLevelQueries = {
+    "UPDATE char_jobs SET unlocked = unlocked | ?, war = ?, genkai = GREATEST(genkai, war) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, mnk = ?, genkai = GREATEST(genkai, mnk) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, whm = ?, genkai = GREATEST(genkai, whm) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, blm = ?, genkai = GREATEST(genkai, blm) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, rdm = ?, genkai = GREATEST(genkai, rdm) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, thf = ?, genkai = GREATEST(genkai, thf) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, pld = ?, genkai = GREATEST(genkai, pld) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, drk = ?, genkai = GREATEST(genkai, drk) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, bst = ?, genkai = GREATEST(genkai, bst) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, brd = ?, genkai = GREATEST(genkai, brd) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, rng = ?, genkai = GREATEST(genkai, rng) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, sam = ?, genkai = GREATEST(genkai, sam) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, nin = ?, genkai = GREATEST(genkai, nin) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, drg = ?, genkai = GREATEST(genkai, drg) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, smn = ?, genkai = GREATEST(genkai, smn) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, blu = ?, genkai = GREATEST(genkai, blu) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, cor = ?, genkai = GREATEST(genkai, cor) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, pup = ?, genkai = GREATEST(genkai, pup) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, dnc = ?, genkai = GREATEST(genkai, dnc) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, sch = ?, genkai = GREATEST(genkai, sch) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, geo = ?, genkai = GREATEST(genkai, geo) WHERE charid = ?",
+    "UPDATE char_jobs SET unlocked = unlocked | ?, run = ?, genkai = GREATEST(genkai, run) WHERE charid = ?",
+};
+
+auto nextId(const db::Query query) -> uint32
 {
-    const auto rset = db::preparedStmt(query);
+    const auto rset = db::preparedStmt(db::selected(query));
     FOR_DB_SINGLE_RESULT(rset)
     {
         return rset->get<uint32>("id") + 1;
@@ -106,8 +132,7 @@ auto createCharacter(const std::string& name) -> bool
         db::preparedStmt("INSERT INTO char_storage (charid) VALUES (?) ON DUPLICATE KEY UPDATE charid = charid", charId) &&
         db::preparedStmt("DELETE FROM char_inventory WHERE charid = ?", charId) &&
         db::preparedStmt("INSERT INTO char_inventory (charid) VALUES (?)", charId) &&
-        db::preparedStmt(fmt::format("UPDATE char_jobs SET unlocked = unlocked | ?, {0} = ?, genkai = GREATEST(genkai, {0}) WHERE charid = ?", jobColumns[job]),
-                         1u << job, level, charId) &&
+        db::preparedStmt(db::selected(jobLevelQueries[job - 1]), 1u << job, level, charId) &&
         db::preparedStmt("UPDATE bot_pool SET charid = ?, accid = ? WHERE name = ?", charId, accId, name);
 
     if (!ok)

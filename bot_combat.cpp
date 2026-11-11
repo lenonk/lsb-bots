@@ -20,6 +20,7 @@
 #include "map/entities/mob_entity.h"
 #include "map/enmity_container.h"
 #include "map/entities/pet_entity.h"
+#include "map/entities/trust_entity.h"
 #include "map/items/item_weapon.h"
 #include "map/party.h"
 #include "map/recast_container.h"
@@ -65,18 +66,15 @@ constexpr uint8 kHasteAllMPP     = 85; // and every melee above this
 constexpr uint8 kStrangerCureMPP = 50; // a passer-by is cured only with this much MP left
 constexpr uint8 kStrangerBuffMPP = 90; // and given Protect or Shell only with this
 
-// Everyone in the party in this zone, the dead included.
+// Everyone in the party in this zone, trusts and the dead included.
 auto partyMembersAll(CCharEntity* PChar) -> std::vector<CBattleEntity*>
 {
     std::vector<CBattleEntity*> members{ PChar };
-    if (PChar->PParty != nullptr)
+    for (auto* PMember : withTrusts(PChar))
     {
-        for (auto* PMember : PChar->PParty->members)
+        if (PMember != PChar && PMember->getZone() == PChar->getZone())
         {
-            if (PMember != PChar && PMember->getZone() == PChar->getZone())
-            {
-                members.push_back(PMember);
-            }
+            members.push_back(PMember);
         }
     }
     return members;
@@ -173,7 +171,7 @@ auto tryCast(Bot& bot, PacketSystem& packets, const SpellID id, CBattleEntity* P
     auto* PSpell = spell::GetSpell(id);
 
     if (PSpell == nullptr || !spell::CanUseSpell(PChar, PSpell) || restrained(bot, PSpell) || PChar->health.mp < PSpell->getMPCost() ||
-        PChar->PRecastContainer->HasRecast(RECAST_MAGIC, static_cast<Recast>(id), 0s) || distance(PChar->loc.p, PTarget->loc.p) > kSpellRange ||
+        PChar->PRecastContainer->HasRecast(xi::RecastType::Magic, static_cast<xi::Recast>(id), 0s) || distance(PChar->loc.p, PTarget->loc.p) > kSpellRange ||
         !throttle(bot, static_cast<uint32>(id), PTarget->id, cooldown, tick))
     {
         return false;
@@ -208,7 +206,7 @@ auto tryAbility(Bot& bot, PacketSystem& packets, const uint16 id, CBattleEntity*
                                  (!bot.directives.avoid.empty() && std::ranges::contains(bot.directives.avoid, familyName(PAbility->getName()))));
     };
 
-    if (PAbility == nullptr || !charutils::hasAbility(PChar, id) || told() || PChar->PRecastContainer->HasRecast(RECAST_ABILITY, PAbility->getRecastId(), 0s) ||
+    if (PAbility == nullptr || !charutils::hasAbility(PChar, id) || told() || PChar->PRecastContainer->HasRecast(xi::RecastType::Ability, PAbility->getRecastId(), 0s) ||
         !throttle(bot, kAbilityKey | id, PTarget->id, std::chrono::seconds(5), tick))
     {
         return false;
@@ -378,20 +376,20 @@ auto chainsWith(const CStatusEffect* PChain, const CWeaponSkill* PSkill) -> bool
 {
     const auto power = PChain->GetPower();
 
-    std::list<SKILLCHAIN_ELEMENT> resonance;
+    std::list<xi::SkillchainType> resonance;
     if (PChain->GetTier() == 0)
     {
-        resonance = { static_cast<SKILLCHAIN_ELEMENT>(power & 0xF), static_cast<SKILLCHAIN_ELEMENT>((power >> 4) & 0xF),
-                      static_cast<SKILLCHAIN_ELEMENT>((power >> 8) & 0xF) };
+        resonance = { static_cast<xi::SkillchainType>(power & 0xF), static_cast<xi::SkillchainType>((power >> 4) & 0xF),
+                      static_cast<xi::SkillchainType>((power >> 8) & 0xF) };
     }
     else
     {
-        resonance = { static_cast<SKILLCHAIN_ELEMENT>(power) };
+        resonance = { static_cast<xi::SkillchainType>(power) };
     }
 
-    return battleutils::FormSkillchain(resonance, { static_cast<SKILLCHAIN_ELEMENT>(PSkill->getPrimarySkillchain()),
-                                                    static_cast<SKILLCHAIN_ELEMENT>(PSkill->getSecondarySkillchain()),
-                                                    static_cast<SKILLCHAIN_ELEMENT>(PSkill->getTertiarySkillchain()) }) != SC_NONE;
+    return battleutils::FormSkillchain(resonance, { static_cast<xi::SkillchainType>(PSkill->getPrimarySkillchain()),
+                                                    static_cast<xi::SkillchainType>(PSkill->getSecondarySkillchain()),
+                                                    static_cast<xi::SkillchainType>(PSkill->getTertiarySkillchain()) }) != xi::SkillchainType::None;
 }
 
 // Cumulative plus volatile enmity: what the monster compares to pick its target.
@@ -585,13 +583,7 @@ auto tryWeaponSkill(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, con
 auto partyMembers(CCharEntity* PChar) -> std::vector<CBattleEntity*>
 {
     std::vector<CBattleEntity*> members;
-    if (PChar->PParty == nullptr)
-    {
-        members.push_back(PChar);
-        return members;
-    }
-
-    for (auto* PMember : PChar->PParty->members)
+    for (auto* PMember : withTrusts(PChar))
     {
         if (PMember->getZone() == PChar->getZone() && !PMember->isDead() && distance(PChar->loc.p, PMember->loc.p) <= kSpellRange)
         {
@@ -725,7 +717,7 @@ auto enfeeble(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const Sta
 
 auto partyHas(CCharEntity* PChar, const Job job) -> bool
 {
-    return PChar->PParty != nullptr && std::ranges::any_of(PChar->PParty->members,
+    return PChar->PParty != nullptr && std::ranges::any_of(withTrusts(PChar),
                                                            [&](const CBattleEntity* PMember) { return !PMember->isDead() && PMember->GetMJob() == job; });
 }
 
@@ -780,7 +772,7 @@ auto nuke(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::
     // A formed skillchain: burst it straight away with a matching element.
     if (const auto* PChain = chainOn(PTarget); PChain != nullptr && PChain->GetTier() > 0)
     {
-        const auto elements = battleutils::GetSkillchainMagicElement(static_cast<SKILLCHAIN_ELEMENT>(PChain->GetPower()));
+        const auto elements = battleutils::GetSkillchainMagicElement(static_cast<xi::SkillchainType>(PChain->GetPower()));
         for (const auto id : kNukes)
         {
             const auto* PSpell = spell::GetSpell(id);
@@ -951,7 +943,7 @@ auto sing(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::
     const bool  narrowed   = PChar->StatusEffectContainer->HasStatusEffect(StatusEffect::Pianissimo);
     const auto* PPiano     = ability::GetAbility(ABILITY_PIANISSIMO);
     const bool  hasPiano   = PPiano != nullptr && charutils::hasAbility(PChar, ABILITY_PIANISSIMO);
-    const bool  pianissimo = hasPiano && (narrowed || !PChar->PRecastContainer->HasRecast(RECAST_ABILITY, PPiano->getRecastId(), 0s));
+    const bool  pianissimo = hasPiano && (narrowed || !PChar->PRecastContainer->HasRecast(xi::RecastType::Ability, PPiano->getRecastId(), 0s));
 
     // Anyone a song sung from a reachable spot could land on.
     std::vector<CBattleEntity*> others;
@@ -1000,7 +992,7 @@ auto sing(Bot& bot, PacketSystem& packets, CBattleEntity* PTarget, const timer::
     {
         for (const auto* song : want.songs)
         {
-            if (std::ranges::contains(considered, song) || PChar->PRecastContainer->HasRecast(RECAST_MAGIC, static_cast<Recast>(song->id), 0s))
+            if (std::ranges::contains(considered, song) || PChar->PRecastContainer->HasRecast(xi::RecastType::Magic, static_cast<xi::Recast>(song->id), 0s))
             {
                 continue;
             }
@@ -1736,7 +1728,7 @@ auto provokeReady(CBattleEntity* PEntity) -> bool
     auto* PChar    = dynamic_cast<CCharEntity*>(PEntity);
     auto* PProvoke = ability::GetAbility(ABILITY_PROVOKE);
     return PChar != nullptr && PProvoke != nullptr && charutils::hasAbility(PChar, ABILITY_PROVOKE) &&
-           !PChar->PRecastContainer->HasRecast(RECAST_ABILITY, PProvoke->getRecastId(), 0s);
+           !PChar->PRecastContainer->HasRecast(xi::RecastType::Ability, PProvoke->getRecastId(), 0s);
 }
 
 // Tanks take hate from anyone but another tank, and from that tank too once it gets low.
@@ -1809,8 +1801,8 @@ auto chosenTank(const uint32 partyId) -> uint32
     return it != tankChoices.end() ? it->second : 0;
 }
 
-// Whoever the party named, else the best tank in it, players included: PLD, then NIN or RUN, then WAR; the higher level
-// breaks a tie.
+// Whoever the party named, else the best tank in it, players and trusts included: PLD, then NIN or RUN, then WAR; the
+// higher level breaks a tie.
 auto mainTank(CCharEntity* PChar) -> CBattleEntity*
 {
     if (PChar->PParty == nullptr)
@@ -1818,9 +1810,10 @@ auto mainTank(CCharEntity* PChar) -> CBattleEntity*
         return nullptr;
     }
 
+    const auto members = withTrusts(PChar);
     if (const auto chosen = chosenTank(PChar->PParty->GetPartyID()); chosen != 0)
     {
-        for (auto* PMember : PChar->PParty->members)
+        for (auto* PMember : members)
         {
             if (PMember->id == chosen && !PMember->isDead() && PMember->getZone() == PChar->getZone())
             {
@@ -1842,7 +1835,7 @@ auto mainTank(CCharEntity* PChar) -> CBattleEntity*
     };
 
     CBattleEntity* PBest = nullptr;
-    for (auto* PMember : PChar->PParty->members)
+    for (auto* PMember : members)
     {
         if (PMember->isDead() || PMember->getZone() != PChar->getZone() || rank(PMember->GetMJob()) == 0)
         {
@@ -1857,7 +1850,8 @@ auto mainTank(CCharEntity* PChar) -> CBattleEntity*
     return PBest;
 }
 
-// Whom the party leans on for cures: its White Mage, else a Red Mage or Scholar; the higher level breaks a tie.
+// Whom the party leans on for cures: its White Mage, else a Red Mage or Scholar; the higher level breaks a tie. A trust
+// only when no player or bot heals, since trusts don't answer a call for cures.
 auto partyHealer(CCharEntity* PChar) -> CBattleEntity*
 {
     if (PChar->PParty == nullptr)
@@ -1865,22 +1859,67 @@ auto partyHealer(CCharEntity* PChar) -> CBattleEntity*
         return nullptr;
     }
 
-    const auto rank = [](const Job job) { return job == Job::WHM ? 2 : job == Job::RDM || job == Job::SCH ? 1 : 0; };
+    const auto rank = [](const CBattleEntity* PMember)
+    {
+        const auto job = PMember->GetMJob();
+        return std::tuple(PMember->objtype != TYPE_TRUST, job == Job::WHM ? 2 : job == Job::RDM || job == Job::SCH ? 1 : 0, PMember->GetMLevel());
+    };
 
     CBattleEntity* PBest = nullptr;
-    for (auto* PMember : PChar->PParty->members)
+    for (auto* PMember : withTrusts(PChar))
     {
-        if (PMember->isDead() || PMember->getZone() != PChar->getZone() || rank(PMember->GetMJob()) == 0)
+        if (PMember->isDead() || PMember->getZone() != PChar->getZone() || std::get<1>(rank(PMember)) == 0)
         {
             continue;
         }
-        if (PBest == nullptr || rank(PMember->GetMJob()) > rank(PBest->GetMJob()) ||
-            (rank(PMember->GetMJob()) == rank(PBest->GetMJob()) && PMember->GetMLevel() > PBest->GetMLevel()))
+        if (PBest == nullptr || rank(PMember) > rank(PBest))
         {
             PBest = PMember;
         }
     }
     return PBest;
+}
+
+auto withTrusts(const CCharEntity* PChar) -> std::vector<CBattleEntity*>
+{
+    std::vector<CBattleEntity*> members;
+    if (PChar->PParty == nullptr)
+    {
+        members.push_back(const_cast<CCharEntity*>(PChar));
+        members.insert(members.end(), PChar->PTrusts.begin(), PChar->PTrusts.end());
+        return members;
+    }
+    members.assign(PChar->PParty->members.begin(), PChar->PParty->members.end());
+    for (auto* PMember : PChar->PParty->members)
+    {
+        if (const auto* POwner = dynamic_cast<const CCharEntity*>(PMember))
+        {
+            members.insert(members.end(), POwner->PTrusts.begin(), POwner->PTrusts.end());
+        }
+    }
+    return members;
+}
+
+auto memberName(const CBattleEntity* PMember) -> std::string
+{
+    return PMember->objtype == TYPE_TRUST ? pretty(PMember->getName()) : PMember->getName();
+}
+
+auto namedAs(const CBattleEntity* PMember, const std::string_view name) -> bool
+{
+    const auto key = [](const std::string_view text)
+    {
+        std::string out;
+        for (const unsigned char c : text)
+        {
+            if (std::isalnum(c))
+            {
+                out += static_cast<char>(std::tolower(c));
+            }
+        }
+        return out;
+    };
+    return !name.empty() && key(PMember->getName()) == key(name);
 }
 
 // As scripts/effects/healing.lua has it: Signet in the old regions, Sigil on the Crystal War fronts.

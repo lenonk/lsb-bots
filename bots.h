@@ -214,10 +214,10 @@ constexpr uint16 kEchoDrops   = 4151;
 constexpr uint16 kPrismPowder = 4164;
 constexpr uint16 kSilentOil   = 4165;
 
-// Bots rest below these, and pullers wait for everyone to be above them.
+// Bots rest below these; pullers wait on them until they've seen what this camp's pulls take (bot_pull.cpp).
 constexpr uint8 kRestHPP = 70;
 constexpr uint8 kRestMPP = 60;
-// The party's healer needs this much MP before another monster comes in.
+// And the party's healer this much MP, until then.
 constexpr uint8 kHealerPullMPP = 85;
 
 // Lowercase, for matching names.
@@ -279,6 +279,9 @@ auto pulledHate(CCharEntity* PChar, CBattleEntity* PTarget) -> bool;
 auto chasedOffTank(CCharEntity* PChar) -> bool;
 auto healingWanted(CCharEntity* PChar) -> bool;
 auto partyHealer(CCharEntity* PChar) -> CBattleEntity*;
+auto withTrusts(const CCharEntity* PChar) -> std::vector<CBattleEntity*>; // the party, then each member's trusts
+auto memberName(const CBattleEntity* PMember) -> std::string;               // a trust as players see it ("Iron Eater")
+auto namedAs(const CBattleEntity* PMember, std::string_view name) -> bool;  // ignoring case, spaces and underscores
 auto signetWorks(const CBattleEntity* PEntity) -> bool; // resting heals more and costs no TP here
 void askForCure(Bot& bot, timer::time_point tick);      // the party's healer answers it first
 auto askedForCure(uint32 charId, timer::time_point tick) -> bool;
@@ -313,6 +316,7 @@ void breakCamp(CBattleEntity* PLeader);
 auto campSpot(const CCharEntity* PChar) -> std::optional<position_t>;
 auto beingPulled(const CCharEntity* PChar, const CBattleEntity* PMob) -> bool;
 auto pull(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CCharEntity* PLeader, timer::time_point tick) -> bool;
+void watchPull(CCharEntity* PChar); // every tick: what the pull under way is taking out of the party
 auto pullStatus(const CCharEntity* PChar) -> std::string;
 auto pullChoice(const std::string& text, CCharEntity* PSpeaker) -> std::optional<std::string>; // the note to answer with, when the line says what to pull
 auto pullChoiceText(const CCharEntity* PChar) -> std::string; // "Pulling only Siege Bat." or ""

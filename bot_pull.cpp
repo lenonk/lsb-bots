@@ -5,9 +5,10 @@
 //   keeps the camp. While the leader is away from it, pulling pauses.
 //
 //   The puller picks the nearest suitable monster within reach of camp and goes once the party will be ready by the
-//   time it gets back with it (HP, MP, the fight at camp over, the tank within a Cure of full), counting the resting,
-//   Refresh and cures in between. It goes straight out, opens on it and runs back. Whenever it holds off it says why,
-//   once. The leader's "pull anyway" skips the waits.
+//   time it gets back with it (HP, MP, the fight at camp over), counting the resting, Refresh and cures in between.
+//   Ready means enough to come through a bad pull, judged by what the last few pulls took out of each member; until it
+//   has seen a couple, the fixed rest lines. It goes straight out, opens on it and runs back. Whenever it holds off it
+//   says why, once. The leader's "pull anyway" skips the waits.
 //
 
 #include "bots.h"
@@ -15,11 +16,13 @@
 #include "common/logging.h"
 #include "common/settings.h"
 
+#include "map/ability.h"
 #include "map/ai/ai_container.h"
 #include "map/ai/helpers/pathfind.h"
 #include "map/entities/char_entity.h"
 #include "map/entities/mob_entity.h"
 #include "map/party.h"
+#include "map/recast_container.h"
 #include "map/spell.h"
 #include "map/status_effect.h"
 #include "map/status_effect_container.h"
@@ -32,6 +35,7 @@
 #include <cmath>
 #include <iterator>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <ranges>
 #include <set>
@@ -49,6 +53,28 @@ enum class Stage : uint8
     Waiting,   // at camp until the party is ready
     Outbound,  // going out to the chosen monster and opening on it
     Returning, // bringing it back
+};
+
+// A member's HP and MP when the pull left camp, and the lowest each went until its fight was over. Convert swaps HP and
+// MP; whichever it lowers is added back, so the swap counts as neither damage nor MP spent.
+struct Sample
+{
+    int32             hp{};
+    int32             mp{};
+    int32             lowHP{};
+    int32             lowMP{};
+    int32             lastHP{}; // as of the last tick
+    int32             lastMP{};
+    int32             convertHP{}; // what Convert took away during this pull
+    int32             convertMP{};
+    timer::time_point converted{}; // when Convert's recast started, as last seen
+};
+
+// What the last few pulls took out of a member, in percent of max: the deepest HP dip and the MP spent.
+struct PullCost
+{
+    std::vector<float> hp;
+    std::vector<float> mp;
 };
 
 struct Pull
@@ -72,6 +98,9 @@ struct Pull
     EntityId              fightMob;    // the monster the party is on, to see how fast it's going down
     timer::time_point     fightSeenAt{};
     uint8                 fightSeenHPP{};
+    std::map<uint32, PullCost> costs;    // by member id
+    std::map<uint32, Sample>   sampling; // this pull, from leaving camp until its fight is over
+    bool                       sampled{}; // its monster reached the party, so it counts
 };
 
 // By party leader.
@@ -105,9 +134,21 @@ constexpr float kTankGrab    = 15.0f; // the main tank takes the pulled monster 
 constexpr float kPullerHome  = 8.0f;  // the puller this close to camp is back, and everyone joins in
 constexpr float kOpenSeconds = 4.0f;  // opening on a monster and turning for home
 constexpr float kSitSeconds  = 3.0f;  // a bot that will rest is down this soon
+constexpr float kTrustQuiet  = 15.0f; // trust_controller.cpp: a trust recovers this long after its fight and the last hit on it,
+constexpr float kTrustEvery  = 3.0f;  // then 5% of its max HP and MP this often
+
+// When each trust was last seen in a fight, by entity id; the controller keeps its own time private.
+std::map<uint32, timer::time_point> trustFought;
 constexpr float kRegenEvery  = 3.0f;  // Regen and Refresh tick
 constexpr float kWatchFight  = 6.0f;  // seconds of a fight before guessing when it ends
 constexpr float kFightSpare  = 3.0f;  // the monster at camp dead this long before the next gets there
+
+constexpr std::size_t kCostPulls   = 8;    // pulls remembered for what a pull takes
+constexpr std::size_t kCostLearned = 2;    // pulls seen before going by them instead of the fixed lines
+constexpr float       kSafeHPP     = 35.0f; // nobody should come out of a bad pull lower than this
+constexpr float       kHealerSpare = 10.0f; // MP percent the healer has left after a bad pull
+constexpr float       kLeastSpread = 3.0f; // percent: the least a bad pull is assumed to take over the usual one
+constexpr uint8       kNukerPullMPP = 30;  // a BLM's MP at most: it holds nukes while the tank builds hate and rests mid-fight below this
 
 auto leaderOfParty(const CCharEntity* PChar) -> CBattleEntity*
 {
@@ -127,7 +168,7 @@ auto pullFor(const CCharEntity* PChar) -> Pull*
 
 auto inPartyOf(const CCharEntity* PChar, const CBattleEntity* PEntity) -> bool
 {
-    return PEntity != nullptr && PChar->PParty != nullptr && std::ranges::contains(PChar->PParty->members, PEntity);
+    return PEntity != nullptr && PChar->PParty != nullptr && std::ranges::contains(withTrusts(PChar), PEntity);
 }
 
 // Monsters on the party right now, leaving out the one being pulled.
@@ -197,6 +238,23 @@ auto outlook(const CBattleEntity* PMember, const bool puller, const float fighti
         sat = fighting + kSitSeconds;
     }
 
+    if (PMember->objtype == TYPE_TRUST)
+    {
+        // Seconds from now until it's out of the fight; a trust that has been out of one is already recovering.
+        float quiet = fighting;
+        if (fighting <= 0.0f && !PMember->PAI->IsEngaged())
+        {
+            const auto it = trustFought.find(PMember->id);
+            const auto at = std::max(PMember->LastAttacked, it != trustFought.end() ? it->second : timer::time_point{});
+            quiet         = -std::chrono::duration<float>(tick - at).count();
+        }
+        const float from  = quiet + kTrustQuiet;
+        const int   ticks = from < 0.0f ? static_cast<int>(seconds / kTrustEvery) : seconds >= from ? 1 + static_cast<int>((seconds - from) / kTrustEvery) : 0;
+        ahead.hp          = std::min(ahead.hp + ticks * PMember->GetMaxHP() / 20, PMember->GetMaxHP());
+        ahead.mp          = std::min(ahead.mp + ticks * PMember->GetMaxMP() / 20, PMember->GetMaxMP());
+        return ahead;
+    }
+
     const float every  = std::max<float>(1.0f, settings::get<uint8>("map.HEALING_TICK_DELAY"));
     const bool  signet = signetWorks(PMember);
     for (int n = ticked + 1; sat && *sat + n * every <= seconds; ++n)
@@ -213,27 +271,21 @@ auto outlook(const CBattleEntity* PMember, const bool puller, const float fighti
     return ahead;
 }
 
-// The cheapest Cure the healer has the MP for that heals `missing`, or with `biggest` the largest it can afford:
-// amount and MP cost, { 0, 0 } for none. Amounts as heal() in bot_combat.cpp reckons them.
-auto cureFor(CBattleEntity* PHealer, const int32 missing, const int32 mp, const bool biggest = false) -> std::pair<int32, int32>
+// The cheapest Cure the healer has the MP for that heals `missing`: amount and MP cost, { 0, 0 } for none. Amounts as
+// heal() in bot_combat.cpp reckons them.
+auto cureFor(CBattleEntity* PHealer, const int32 missing, const int32 mp) -> std::pair<int32, int32>
 {
     static constexpr std::array<std::pair<SpellID, int32>, 4> cures = { { { SpellID::Cure, 40 }, { SpellID::Cure_II, 100 }, { SpellID::Cure_III, 220 }, { SpellID::Cure_IV, 450 } } };
 
-    std::pair<int32, int32> found{};
     for (const auto& [id, amount] : cures)
     {
         const auto* PSpell = spell::GetSpell(id);
-        if (PSpell == nullptr || !spell::CanUseSpell(PHealer, id) || mp < PSpell->getMPCost())
+        if (PSpell != nullptr && spell::CanUseSpell(PHealer, id) && mp >= PSpell->getMPCost() && amount >= missing)
         {
-            continue;
-        }
-        found = { amount, PSpell->getMPCost() };
-        if (!biggest && amount >= missing)
-        {
-            return found;
+            return { amount, PSpell->getMPCost() };
         }
     }
-    return biggest ? found : std::pair<int32, int32>{};
+    return {};
 }
 
 // Seconds until the monster the party is on goes down, from how fast it has been dropping; nothing until that shows.
@@ -260,12 +312,117 @@ auto percent(const int32 value, const int32 max) -> int32
     return max > 0 ? value * 100 / max : 100;
 }
 
+// A bad pull's worth from the remembered ones: the mean plus one standard deviation.
+auto badPull(const std::vector<float>& taken) -> float
+{
+    const float mean = std::accumulate(taken.begin(), taken.end(), 0.0f) / static_cast<float>(taken.size());
+    float       var  = 0.0f;
+    for (const float x : taken)
+    {
+        var += (x - mean) * (x - mean);
+    }
+    return mean + std::max(kLeastSpread, std::sqrt(var / static_cast<float>(taken.size())));
+}
+
+struct Needs
+{
+    int32 hp{}; // percent of max, when a pull reaches camp
+    int32 mp{};
+    bool  learned{};
+};
+
+// What a member should have when a pull gets to camp: HP to come through a bad pull above kSafeHPP; MP for a bad pull
+// for the healer (plus a reserve) and the tank, for a usual one for anyone else, and for a BLM no more than
+// kNukerPullMPP. The fixed lines until it has seen a couple of pulls.
+auto needsOf(const Pull& pull, const CBattleEntity* PMember, const bool healer, const bool tank) -> Needs
+{
+    const bool nuker = PMember->GetMJob() == xi::Job::BLM && !healer && !tank;
+    const auto it    = pull.costs.find(PMember->id);
+    if (it == pull.costs.end() || it->second.hp.size() < kCostLearned)
+    {
+        return { tank ? kTankPullHPP : kRestHPP, healer ? kHealerPullMPP : nuker ? kNukerPullMPP : kRestMPP, false };
+    }
+    const auto& cost  = it->second;
+    const float usual = std::accumulate(cost.mp.begin(), cost.mp.end(), 0.0f) / static_cast<float>(cost.mp.size());
+    const float mp    = healer ? badPull(cost.mp) + kHealerSpare : tank ? badPull(cost.mp) : nuker ? std::min<float>(usual, kNukerPullMPP) : usual;
+    return { std::clamp(static_cast<int32>(std::ceil(kSafeHPP + badPull(cost.hp))), 0, 100), std::clamp(static_cast<int32>(std::ceil(mp)), 0, 100), true };
+}
+
+void remember(std::vector<float>& taken, const float value)
+{
+    taken.push_back(value);
+    if (taken.size() > kCostPulls)
+    {
+        taken.erase(taken.begin());
+    }
+}
+
+// What this pull took out of each member, kept with the last few. One whose monster never reached the party doesn't count.
+void endSample(CCharEntity* PChar, Pull& pull)
+{
+    if (pull.sampled)
+    {
+        auto*                    PHealer = partyHealer(PChar);
+        auto*                    PTank   = mainTank(PChar);
+        std::vector<std::string> parts;
+        for (const auto* PMember : withTrusts(PChar))
+        {
+            const auto it = pull.sampling.find(PMember->id);
+            if (it == pull.sampling.end())
+            {
+                continue;
+            }
+            const auto& seen = it->second;
+            const float hp   = 100.0f * static_cast<float>(std::max(0, seen.hp - seen.lowHP)) / static_cast<float>(std::max(1, PMember->GetMaxHP()));
+            const float mp   = PMember->GetMaxMP() > 0 ? 100.0f * static_cast<float>(std::max(0, seen.mp - seen.lowMP)) / static_cast<float>(PMember->GetMaxMP()) : 0.0f;
+            auto&       cost = pull.costs[PMember->id];
+            remember(cost.hp, hp);
+            remember(cost.mp, mp);
+            const auto need = needsOf(pull, PMember, PMember == PHealer, PMember == PTank);
+            parts.push_back(fmt::format("{} -{:.0f}% HP -{:.0f}% MP (next needs {}% HP{})", memberName(PMember), hp, mp, need.hp,
+                                        PMember->GetMaxMP() > 0 ? fmt::format(", {}% MP", need.mp) : std::string()));
+        }
+        ShowInfoFmt("bots: what the pull took: {}", fmt::join(parts, "; "));
+    }
+    pull.sampling.clear();
+    pull.sampled = false;
+}
+
+// When the member's Convert recast started; nothing while it isn't recasting.
+auto convertedAt(const CBattleEntity* PMember) -> timer::time_point
+{
+    const auto* PConvert = ability::GetAbility(ABILITY_CONVERT);
+    const auto* recast   = PConvert != nullptr ? PMember->PRecastContainer->GetRecast(xi::RecastType::Ability, PConvert->getRecastId()) : nullptr;
+    return recast != nullptr ? recast->TimeStamp : timer::time_point{};
+}
+
+// The party as the pull leaves camp; the one before, if its fight is still going, is counted now.
+void startSample(CCharEntity* PChar, Pull& pull)
+{
+    endSample(PChar, pull);
+    for (const auto* PMember : withTrusts(PChar))
+    {
+        const auto hp              = PMember->health.hp;
+        const auto mp              = PMember->health.mp;
+        pull.sampling[PMember->id] = { .hp = hp, .mp = mp, .lowHP = hp, .lowMP = mp, .lastHP = hp, .lastMP = mp, .converted = convertedAt(PMember) };
+    }
+}
+
 // What the puller waits on before going out: a key (each reason is said once) and the party line, or an empty key when
 // it's ready. Judged the way a puller times it: on where the party will be when a monster `trip` seconds out gets to
 // camp. The fight at camp will be over, resting and Refresh go on meanwhile, the healer tops up anyone a Cure short,
 // and the main tank needs no more than one of its biggest. A fight with no end in sight has a key but no line.
 auto waitingOn(CCharEntity* PChar, Pull& pull, const float trip, const timer::time_point tick) -> std::pair<std::string, std::string>
 {
+    const auto members = withTrusts(PChar);
+    for (const auto* PMember : members)
+    {
+        if (PMember->objtype == TYPE_TRUST && PMember->PAI->IsEngaged())
+        {
+            trustFought[PMember->id] = tick;
+        }
+    }
+
     const auto mobs = partyMobs(PChar);
     if (mobs.size() > 1)
     {
@@ -281,16 +438,24 @@ auto waitingOn(CCharEntity* PChar, Pull& pull, const float trip, const timer::ti
         }
         fighting = *left;
     }
-    auto* PTank = mainTank(PChar);
-    if (!mobs.empty() && PTank != nullptr && PTank->GetHPP() < kTankPullHPP)
+    auto* PTank   = mainTank(PChar);
+    auto* PHealer = partyHealer(PChar);
+    if (const auto need = PTank != nullptr ? needsOf(pull, PTank, PTank == PHealer, true).hp : 0; !mobs.empty() && PTank != nullptr && PTank->GetHPP() < need)
     {
-        return { fmt::format("tank:{}", PTank->getName()), fmt::format("Waiting on {}'s HP ({}%) before pulling another.", PTank->getName(), PTank->GetHPP()) };
+        return { fmt::format("tank:{}", PTank->getName()),
+                 fmt::format("Waiting on {}'s HP ({}%, needs {}%) before pulling another.", memberName(PTank), PTank->GetHPP(), need) };
     }
 
-    std::vector<std::pair<CBattleEntity*, Outlook>> party;
-    for (auto* PMember : PChar->PParty->members)
+    struct Member
     {
-        const auto name = PMember->getName();
+        CBattleEntity* who{};
+        Outlook        ahead;
+        Needs          need;
+    };
+    std::vector<Member> party;
+    for (auto* PMember : members)
+    {
+        const auto name = memberName(PMember);
         if (PMember->isDead())
         {
             return { fmt::format("dead:{}", name), fmt::format("Waiting: {} is down.", name) };
@@ -303,43 +468,43 @@ auto waitingOn(CCharEntity* PChar, Pull& pull, const float trip, const timer::ti
         {
             return { fmt::format("weak:{}", name), fmt::format("Waiting for {}'s weakness to wear off.", name) };
         }
-        party.emplace_back(PMember, outlook(PMember, PMember == PChar, fighting, trip, tick));
+        party.push_back({ PMember, outlook(PMember, PMember == PChar, fighting, trip, tick), needsOf(pull, PMember, PMember == PHealer, PMember == PTank) });
     }
 
-    auto*      PHealer = partyHealer(PChar);
-    const auto healer  = std::ranges::find(party, PHealer, &std::pair<CBattleEntity*, Outlook>::first);
-    int32      spare   = healer != party.end() ? healer->second.mp : 0; // the healer's MP, less the cures it'll cast
-    const auto later   = [&](const int32 now, const int32 then)
+    const auto healer = std::ranges::find(party, PHealer, &Member::who);
+    int32      spare  = healer != party.end() ? healer->ahead.mp : 0; // the healer's MP, less the cures it'll cast
+    const auto later  = [&](const int32 now, const int32 then)
     { return trip > 0.0f && then != now ? fmt::format("{}% now, {}% when a pull gets here", now, then) : fmt::format("{}%", now); };
 
-    for (const auto& [PMember, ahead] : party)
+    // Anyone short of what a pull needs gets a Cure up to it, if the healer has one.
+    for (const auto& [PMember, ahead, need] : party)
     {
-        const auto name    = PMember->getName();
+        const auto name    = memberName(PMember);
         const auto maxHP   = PMember->GetMaxHP();
-        const auto missing = PMember == PTank || PHealer == nullptr ? maxHP - ahead.hp : maxHP * kRestHPP / 100 - ahead.hp;
-        bool       fine    = PMember == PTank ? percent(ahead.hp, maxHP) >= kTankPullHPP : percent(ahead.hp, maxHP) >= kRestHPP;
-        if (PHealer != nullptr && missing > 0)
+        const auto missing = maxHP * need.hp / 100 - ahead.hp;
+        bool       fine    = missing <= 0;
+        if (PHealer != nullptr && !fine)
         {
-            // The tank needs to be within one big Cure of full; anyone else gets one up to the rest line.
-            const auto [amount, cost] = PMember == PTank ? cureFor(PHealer, missing, spare, true) : cureFor(PHealer, missing, spare);
-            fine = amount >= missing;
-            if (fine && (PMember != PTank || percent(ahead.hp, maxHP) < kTankPullHPP))
+            const auto [amount, cost] = cureFor(PHealer, missing, spare);
+            fine                      = amount >= missing;
+            if (fine)
             {
                 spare -= cost;
             }
         }
         if (!fine)
         {
-            return { fmt::format("HP:{}", name), fmt::format("Waiting on {}'s HP ({}) before pulling.", name, later(PMember->GetHPP(), percent(ahead.hp, maxHP))) };
+            return { fmt::format("HP:{}", name),
+                     fmt::format("Waiting on {}'s HP ({}, needs {}%) before pulling.", name, later(PMember->GetHPP(), percent(ahead.hp, maxHP)), need.hp) };
         }
     }
-    for (const auto& [PMember, ahead] : party)
+    for (const auto& [PMember, ahead, need] : party)
     {
         const auto mp = PMember == PHealer ? spare : ahead.mp;
-        if (PMember->GetMaxMP() > 0 && percent(mp, PMember->GetMaxMP()) < (PMember == PHealer ? kHealerPullMPP : kRestMPP))
+        if (PMember->GetMaxMP() > 0 && percent(mp, PMember->GetMaxMP()) < need.mp)
         {
-            return { fmt::format("MP:{}", PMember->getName()),
-                     fmt::format("Waiting on {}'s MP ({}) before pulling.", PMember->getName(), later(PMember->GetMPP(), percent(mp, PMember->GetMaxMP()))) };
+            return { fmt::format("MP:{}", PMember->getName()), fmt::format("Waiting on {}'s MP ({}, needs {}%) before pulling.", memberName(PMember),
+                                                                         later(PMember->GetMPP(), percent(mp, PMember->GetMaxMP())), need.mp) };
         }
     }
     return {};
@@ -362,7 +527,7 @@ void paced(Pull& pull, const timer::time_point tick)
 auto danger(CCharEntity* PChar) -> bool
 {
     return partyMobs(PChar).size() > 1 ||
-           std::ranges::any_of(PChar->PParty->members, [](const CBattleEntity* PMember) { return !PMember->isDead() && PMember->GetHPP() < kTroubleHPP; });
+           std::ranges::any_of(withTrusts(PChar), [](const CBattleEntity* PMember) { return !PMember->isDead() && PMember->GetHPP() < kTroubleHPP; });
 }
 
 auto choiceFor(const CCharEntity* PChar) -> const Choice*
@@ -435,7 +600,7 @@ auto unpullable(const CCharEntity* PChar, CMobEntity* PMob, const position_t& ca
 // Exp parties pull above themselves: a full party up to very tough, a small one not much past an even match.
 auto toughestGap(const CCharEntity* PChar) -> int
 {
-    const auto size = PChar->PParty != nullptr ? PChar->PParty->members.size() : 1;
+    const auto size = PChar->PParty != nullptr ? withTrusts(PChar).size() : 1;
     return size >= 5 ? 5 : size >= 3 ? 3 : 2;
 }
 
@@ -1027,6 +1192,43 @@ auto beingPulled(const CCharEntity* PChar, const CBattleEntity* PMob) -> bool
     return !(mainTank(const_cast<CCharEntity*>(PChar)) == PChar && distance(PChar->loc.p, PMob->loc.p) <= kTankGrab);
 }
 
+// Every tick for the puller, whatever it's doing: the lowest HP and MP each member reaches during a pull, and its end once
+// the fight it brought is over.
+void watchPull(CCharEntity* PChar)
+{
+    auto* pull = pullFor(PChar);
+    if (pull == nullptr || pull->pullerId != PChar->id || pull->sampling.empty())
+    {
+        return;
+    }
+    for (const auto* PMember : withTrusts(PChar))
+    {
+        if (const auto it = pull->sampling.find(PMember->id); it != pull->sampling.end())
+        {
+            auto&      seen = it->second;
+            const auto hp   = PMember->health.hp;
+            const auto mp   = PMember->health.mp;
+            if (const auto at = convertedAt(PMember); at > seen.converted)
+            {
+                const auto lostHP = std::max(0, seen.lastHP - hp);
+                const auto lostMP = std::max(0, seen.lastMP - mp);
+                seen.convertHP += lostHP;
+                seen.convertMP += lostMP;
+                seen.converted = at;
+                ShowInfoFmt("bots: {} used Convert during the pull; {} HP and {} MP of the swap left out of what it took", memberName(PMember), lostHP, lostMP);
+            }
+            seen.lastHP = hp;
+            seen.lastMP = mp;
+            seen.lowHP  = std::min(seen.lowHP, PMember->isDead() ? 0 : hp + seen.convertHP);
+            seen.lowMP  = std::min(seen.lowMP, mp + seen.convertMP);
+        }
+    }
+    if (pull->stage == Stage::Waiting && partyMobs(PChar).empty())
+    {
+        endSample(PChar, *pull);
+    }
+}
+
 auto pull(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CCharEntity* PLeader, const timer::time_point tick) -> bool
 {
     auto* pull = pullFor(PChar);
@@ -1110,6 +1312,7 @@ auto pull(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CCharEntity* PLea
             pull->deadline = tick + runTime(distance(PChar->loc.p, PMob->loc.p)) * 2 + kSpareTime;
             pull->leftAt   = tick;
             pull->expected = tripSeconds(PChar, *pull, PMob);
+            startSample(PChar, *pull);
             ShowInfoFmt("bots: {} is going for {} (level {}, {:.0f} yalms from camp, back in ~{:.0f}s{})", PChar->getName(), PMob->getName(), PMob->GetMLevel(),
                         distance(camp, PMob->loc.p), pull->expected * pull->pace, pull->force ? ", told to pull anyway" : "");
             [[fallthrough]];
@@ -1122,7 +1325,8 @@ auto pull(Bot& bot, PacketSystem& packets, CCharEntity* PChar, CCharEntity* PLea
             const bool ours = PMob != nullptr && (PMob->GetBattleTarget() == PChar || (PMob->PAI->IsEngaged() && inPartyOf(PChar, PMob->GetBattleTarget())));
             if (ours)
             {
-                pull->force = false;
+                pull->force   = false;
+                pull->sampled = true;
                 pull->waitSaid.clear();
                 pull->stage    = Stage::Returning;
                 pull->stageAt  = tick;
